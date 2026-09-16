@@ -53,8 +53,10 @@ variables desde la sección Environment del servicio.
 | `UNITEC_EMAIL` | Correo usado para renovar una sesión vencida. |
 | `UNITEC_PASSWORD` | Contraseña usada únicamente durante la renovación headless. |
 | `AUTH_STATE_B64` | Sesión inicial exportada; puede eliminarse después del primer arranque. |
-| `REMINDER_HOURS` | Umbrales, por defecto `72,24,6,1`. |
-| `DAILY_DIGEST_HOUR` | Hora local del resumen, por defecto `7`. |
+| `REMINDER_HOURS` | Umbrales de recordatorio, por defecto `72,24,6,3,1`. |
+| `DAILY_DIGEST_HOUR` | Hora local del resumen diario, por defecto `18`. |
+| `TELEGRAM_COMMANDS` | `false` desactiva la atención de comandos. |
+| `TELEGRAM_POLL_TIMEOUT` | Segundos de long polling, por defecto `50`. |
 | `TIMEZONE` | Zona horaria, por defecto `America/Tegucigalpa`. |
 
 ## Configurar Telegram de forma segura
@@ -118,15 +120,41 @@ varias líneas o recortarlo. Los saltos de línea y espacios ya se limpian
 automáticamente, pero un valor truncado se rechaza con un mensaje explícito.
 Vuelve a generarlo con `npm run auth:export` y pega el contenido completo.
 
+## Comandos en Telegram
+
+El servicio que mantiene vivo al contenedor también atiende comandos, así que se
+pueden consultar las tareas en cualquier momento sin esperar la revisión de los
+30 minutos. El menú se registra en Telegram al arrancar.
+
+| Comando | Qué devuelve |
+| --- | --- |
+| `/tareas` | Todas las pendientes, agrupadas por urgencia. |
+| `/hoy` | Solo lo que vence hoy. |
+| `/semana` | Los próximos 7 días. |
+| `/vencidas` | Lo que ya pasó de fecha. |
+| `/resumen` | El resumen diario, en el momento. |
+| `/revisar` | Consulta Canvas en vivo y luego responde. |
+| `/estado` | Sesión, última revisión, conteos y configuración. |
+| `/ayuda` | La lista de comandos. |
+
+Las consultas se responden con lo último guardado en SQLite, por lo que son
+inmediatas e incluyen cuándo se actualizó. `/revisar` es el único que sale a
+Canvas, y comparte el mismo archivo de bloqueo que la tarea programada: si una
+revisión ya está en curso, lo dice en lugar de duplicarla.
+
+Solo se atiende el chat indicado en `TELEGRAM_CHAT_ID`; los mensajes de cualquier
+otro se registran y se descartan. Los comandos quedan inactivos mientras
+`TELEGRAM_DRY_RUN` sea `true`, porque sin envío real no habría respuesta.
+
 ## Alertas
 
 El monitor envía mensajes cuando:
 
 - aparece una actividad nueva;
 - cambia una fecha de entrega;
-- faltan 72, 24, 6 o 1 hora;
+- faltan 72, 24, 6, 3 o 1 hora;
 - una actividad vence;
-- llega la hora del resumen diario;
+- llega la hora del resumen diario (18:00 local, haya novedades o no);
 - Microsoft exige intervención para renovar la sesión.
 
 SQLite registra cada alerta después de que Telegram la acepta. Si el trabajo vuelve

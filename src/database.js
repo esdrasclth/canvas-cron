@@ -14,6 +14,7 @@ function openDatabase() {
       status TEXT NOT NULL,
       url TEXT NOT NULL,
       points REAL,
+      type TEXT,
       first_seen_at TEXT NOT NULL,
       last_seen_at TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1
@@ -32,14 +33,18 @@ function openDatabase() {
     );
   `);
 
+  // Las bases creadas antes de guardar el tipo de actividad se migran aqui.
+  const columns = db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name);
+  if (!columns.includes('type')) db.exec('ALTER TABLE tasks ADD COLUMN type TEXT');
+
   const statements = {
     getTask: db.prepare('SELECT * FROM tasks WHERE task_key = ?'),
     upsertTask: db.prepare(`
       INSERT INTO tasks (
-        task_key, title, course, due_at, lock_at, status, url, points,
+        task_key, title, course, due_at, lock_at, status, url, points, type,
         first_seen_at, last_seen_at, active
       ) VALUES (
-        @key, @title, @course, @dueAt, @lockAt, @status, @url, @points,
+        @key, @title, @course, @dueAt, @lockAt, @status, @url, @points, @type,
         @now, @now, 1
       )
       ON CONFLICT(task_key) DO UPDATE SET
@@ -50,10 +55,12 @@ function openDatabase() {
         status = excluded.status,
         url = excluded.url,
         points = excluded.points,
+        type = excluded.type,
         last_seen_at = excluded.last_seen_at,
         active = 1
     `),
     deactivateAll: db.prepare('UPDATE tasks SET active = 0'),
+    listActive: db.prepare('SELECT * FROM tasks WHERE active = 1 ORDER BY due_at'),
     hasNotification: db.prepare('SELECT 1 FROM notifications WHERE notification_key = ?'),
     addNotification: db.prepare(`
       INSERT OR IGNORE INTO notifications (notification_key, task_key, kind, sent_at)
@@ -69,6 +76,19 @@ function openDatabase() {
   return {
     db,
     getTask: (key) => statements.getTask.get(key),
+    // Devuelve las tareas con la misma forma que entrega Canvas, para que los
+    // formateadores sirvan igual con datos frescos o guardados.
+    listActiveTasks: () => statements.listActive.all().map((row) => ({
+      key: row.task_key,
+      title: row.title,
+      course: row.course,
+      dueAt: row.due_at,
+      lockAt: row.lock_at,
+      status: row.status,
+      url: row.url,
+      points: row.points,
+      type: row.type,
+    })),
     syncTasks(tasks, now) {
       const sync = db.transaction(() => {
         statements.deactivateAll.run();

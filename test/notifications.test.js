@@ -25,16 +25,23 @@ function task(overrides = {}) {
 }
 
 test('selecciona el recordatorio más cercano que corresponde', () => {
+  // Faltan 3 horas exactas, asi que corresponde el umbral de 3 h y no el de 6.
   const now = new Date('2026-09-16T07:00:00.000Z');
   const alerts = buildTaskAlerts([task()], fakeDatabase(), now);
   assert.equal(alerts.length, 2);
   assert.equal(alerts[0].kind, 'new');
-  assert.equal(alerts[1].kind, 'deadline_6h');
+  assert.equal(alerts[1].kind, 'deadline_3h');
+});
+
+test('avisa con el umbral de 6 h cuando aun no se entra en el de 3 h', () => {
+  const now = new Date('2026-09-16T05:00:00.000Z');
+  const alerts = buildTaskAlerts([task()], fakeDatabase({ initialized: false }), now);
+  assert.deepEqual(alerts.map((alert) => alert.kind), ['deadline_6h']);
 });
 
 test('no repite un recordatorio ya enviado', () => {
   const now = new Date('2026-09-16T07:00:00.000Z');
-  const sent = ['deadline:1:2:2026-09-16T10:00:00.000Z:6'];
+  const sent = ['deadline:1:2:2026-09-16T10:00:00.000Z:3'];
   const alerts = buildTaskAlerts([task()], fakeDatabase({ initialized: false, sent }), now);
   assert.equal(alerts.length, 0);
 });

@@ -23,8 +23,8 @@ module.exports = {
   outputDir: path.join(dataDir, 'output'),
   lockFile: path.join(dataDir, 'check.lock'),
   timezone: process.env.TIMEZONE || 'America/Tegucigalpa',
-  digestHour: numberValue('DAILY_DIGEST_HOUR', 7),
-  reminderHours: (process.env.REMINDER_HOURS || '72,24,6,1')
+  digestHour: numberValue('DAILY_DIGEST_HOUR', 18),
+  reminderHours: (process.env.REMINDER_HOURS || '72,24,6,3,1')
     .split(',')
     .map(Number)
     .filter((value) => Number.isFinite(value) && value > 0)
@@ -42,5 +42,7 @@ module.exports = {
   sendInitialNewTasks: booleanValue('SEND_INITIAL_NEW_TASKS', false),
   sendStartupDigest: booleanValue('SEND_STARTUP_DIGEST', true),
   healthPort: numberValue('PORT', 3000),
+  telegramCommands: booleanValue('TELEGRAM_COMMANDS', true),
+  pollTimeoutSeconds: numberValue('TELEGRAM_POLL_TIMEOUT', 50),
 };
 
