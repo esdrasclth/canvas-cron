@@ -1,0 +1,111 @@
+# Monitor de tareas de UNITEC y Canvas
+
+Servicio de Node.js que consulta Canvas con una sesión guardada, identifica tareas
+pendientes y envía alertas por Telegram. Está preparado para ejecutarse en un
+contenedor administrado por Dokploy sin abrir un navegador durante las revisiones
+normales.
+
+Chromium solo se inicia en modo headless cuando la sesión necesita renovarse.
+
+## Comandos locales
+
+```powershell
+npm install
+npm run portal
+npm run tasks
+npm run check
+npm test
+```
+
+- `npm run portal`: abre el portal para iniciar sesión manualmente.
+- `npm run tasks`: genera la lista local anterior de tareas.
+- `npm run check`: ejecuta el monitor y las reglas de notificación.
+- `npm run service`: inicia el endpoint interno `/health` para mantener activo el contenedor.
+- `npm run auth:export`: exporta la sesión en Base64 para cargarla inicialmente en Dokploy.
+- `npm run telegram:setup`: valida el token del bot y encuentra el `chat_id` después de enviarle `/start`.
+
+`npm run check` usa Telegram en modo de prueba mientras falten el token o el chat ID.
+Los mensajes aparecen en la terminal y no se envían.
+
+## Datos persistentes
+
+En desarrollo se usa `./data`. En Docker se monta `/app/data`, que contiene:
+
+```text
+auth/unitec.json       Sesión de Canvas
+chrome-profile/        Perfil utilizado para renovar la sesión
+notifications.db       Tareas y alertas ya enviadas
+output/                Último resultado de la extracción
+```
+
+La carpeta está excluida de Git. Su contenido debe tratarse como una credencial.
+
+## Variables
+
+Copia `.env.example` como `.env` para desarrollo. En Dokploy configura las
+variables desde la sección Environment del servicio.
+
+| Variable | Uso |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Token entregado por BotFather. |
+| `TELEGRAM_CHAT_ID` | Chat privado que recibirá las alertas. |
+| `TELEGRAM_DRY_RUN` | `false` habilita el envío real. |
+| `UNITEC_EMAIL` | Correo usado para renovar una sesión vencida. |
+| `UNITEC_PASSWORD` | Contraseña usada únicamente durante la renovación headless. |
+| `AUTH_STATE_B64` | Sesión inicial exportada; puede eliminarse después del primer arranque. |
+| `REMINDER_HOURS` | Umbrales, por defecto `72,24,6,1`. |
+| `DAILY_DIGEST_HOUR` | Hora local del resumen, por defecto `7`. |
+| `TIMEZONE` | Zona horaria, por defecto `America/Tegucigalpa`. |
+
+## Configurar Telegram de forma segura
+
+El token de BotFather es una credencial con control total del bot. Si se comparte
+por accidente, revócalo en BotFather con `/revoke` y genera uno nuevo con `/token`.
+Configura el token nuevo directamente en Dokploy y no lo pegues en el repositorio
+ni en el chat. El `TELEGRAM_CHAT_ID` de este usuario es `679645775`.
+
+## Despliegue en Dokploy
+
+1. Sube el proyecto a un repositorio privado.
+2. En Dokploy crea un servicio **Docker Compose** desde ese repositorio.
+3. Copia las variables de `.env.example` en la sección Environment.
+4. Genera la sesión inicial localmente:
+
+   ```powershell
+   npm run auth:export
+   ```
+
+5. Copia el contenido de `artifacts/unitec-auth.b64` a `AUTH_STATE_B64` en Dokploy.
+6. Despliega el Compose. El volumen `unitec-bot-data` conservará la sesión y SQLite.
+7. En **Schedules**, crea un trabajo de tipo **Compose**:
+   - Servicio: `unitec-bot`
+   - Comando: `npm run check`
+   - Cron: `*/30 * * * *`
+   - Zona horaria: `America/Tegucigalpa`
+8. Ejecuta el trabajo manualmente con `TELEGRAM_DRY_RUN=true` y revisa los logs.
+9. Configura el bot y cambia `TELEGRAM_DRY_RUN=false`.
+10. Elimina `AUTH_STATE_B64` después de confirmar que `/app/data/auth/unitec.json` existe.
+
+No es necesario publicar un dominio. El servicio de salud escucha en el puerto
+3000 dentro del contenedor y el trabajo programado se ejecuta con `docker exec`.
+
+## Alertas
+
+El monitor envía mensajes cuando:
+
+- aparece una actividad nueva;
+- cambia una fecha de entrega;
+- faltan 72, 24, 6 o 1 hora;
+- una actividad vence;
+- llega la hora del resumen diario;
+- Microsoft exige intervención para renovar la sesión.
+
+SQLite registra cada alerta después de que Telegram la acepta. Si el trabajo vuelve
+a ejecutarse, el mismo aviso no se repite.
+
+## Sesión vencida
+
+El monitor primero intenta renovar la sesión con Chromium headless y las variables
+`UNITEC_EMAIL` y `UNITEC_PASSWORD`. Si Microsoft solicita MFA, CAPTCHA o una
+confirmación adicional, se envía una alerta técnica y será necesario generar y
+cargar una sesión nueva. El proceso no intenta evadir esos controles.

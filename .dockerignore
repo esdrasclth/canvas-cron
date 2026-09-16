@@ -1,0 +1,8 @@
+node_modules
+data
+artifacts
+playwright/.auth
+.git
+.env
+*.log
+

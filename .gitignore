@@ -1,0 +1,7 @@
+node_modules/
+.playwright-profile/
+playwright/.auth/
+artifacts/
+data/
+data-*/
+.env
