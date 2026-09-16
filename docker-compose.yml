@@ -24,6 +24,14 @@ services:
       AUTH_STATE_B64: ${AUTH_STATE_B64:-}
     volumes:
       - unitec-bot-data:/app/data
+    healthcheck:
+      # /alive responde 200 aunque falte la sesion: el contenedor debe seguir en
+      # pie para que las tareas programadas de Dokploy puedan ejecutarse.
+      test: ["CMD-SHELL", "node -e \"require('node:http').get('http://127.0.0.1:3000/alive',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
 volumes:
   unitec-bot-data:

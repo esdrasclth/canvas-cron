@@ -14,13 +14,28 @@ async function ensureDataDirectories() {
   ]);
 }
 
+function decodeAuthState(raw) {
+  // Dokploy y otros editores de variables pueden introducir saltos de linea o
+  // espacios al pegar el base64; se limpian antes de decodificar.
+  const sanitized = raw.replace(/\s+/g, '');
+  const decoded = Buffer.from(sanitized, 'base64').toString('utf8');
+  try {
+    JSON.parse(decoded);
+  } catch (error) {
+    throw new Error(
+      `AUTH_STATE_B64 no contiene un JSON valido tras decodificar (${error.message}). ` +
+        'Vuelve a generarlo con "npm run auth:export" y pegalo completo en una sola linea.',
+    );
+  }
+  return decoded;
+}
+
 async function seedAuthState() {
   await ensureDataDirectories();
   if (await exists(config.authFile)) return false;
 
   if (process.env.AUTH_STATE_B64) {
-    const decoded = Buffer.from(process.env.AUTH_STATE_B64, 'base64').toString('utf8');
-    JSON.parse(decoded);
+    const decoded = decodeAuthState(process.env.AUTH_STATE_B64);
     await fs.writeFile(config.authFile, decoded, { encoding: 'utf8', mode: 0o600 });
     return true;
   }
@@ -41,5 +56,5 @@ async function writeJsonAtomic(file, value) {
   await fs.rename(temporary, file);
 }
 
-module.exports = { ensureDataDirectories, exists, seedAuthState, writeJsonAtomic };
+module.exports = { decodeAuthState, ensureDataDirectories, exists, seedAuthState, writeJsonAtomic };
 

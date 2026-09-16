@@ -66,8 +66,13 @@ ni en el chat. El `TELEGRAM_CHAT_ID` de este usuario es `679645775`.
 
 ## Despliegue en Dokploy
 
-1. Sube el proyecto a un repositorio privado.
-2. En Dokploy crea un servicio **Docker Compose** desde ese repositorio.
+El código vive en `https://github.com/esdrasclth/canvas-cron`. Usa ese repositorio
+como fuente en Dokploy: la subida directa de un ZIP devuelve `500 Internal Server
+Error` y no es una vía fiable.
+
+1. En Dokploy crea un servicio **Docker Compose** y elige el proveedor **GitHub**.
+2. Selecciona el repositorio `esdrasclth/canvas-cron`, rama `main`, y deja
+   `docker-compose.yml` como ruta del Compose.
 3. Copia las variables de `.env.example` en la sección Environment.
 4. Genera la sesión inicial localmente:
 
@@ -88,6 +93,30 @@ ni en el chat. El `TELEGRAM_CHAT_ID` de este usuario es `679645775`.
 
 No es necesario publicar un dominio. El servicio de salud escucha en el puerto
 3000 dentro del contenedor y el trabajo programado se ejecuta con `docker exec`.
+
+## Diagnóstico en Dokploy
+
+**El schedule responde `Container not found`.** Significa que no hay contenedor en
+ejecución al que entrar, casi siempre porque el proceso principal murió y
+`restart: unless-stopped` lo dejó en bucle de reinicio. Revisa los logs del
+Compose y comprueba el estado del contenedor. El servidor de salud ya no termina
+el proceso cuando falla la preparación de la sesión: se mantiene en pie y reporta
+el motivo, de modo que el `docker exec` del schedule siempre encuentre destino.
+
+**Comprobar el estado desde dentro del contenedor:**
+
+```sh
+node -e "require('node:http').get('http://127.0.0.1:3000/health',r=>{r.pipe(process.stdout)})"
+```
+
+- `{"status":"ready"}` — la sesión está cargada y `npm run check` puede ejecutarse.
+- `{"status":"authentication_required","error":"..."}` — falta la sesión; el campo
+  `error` indica si `AUTH_STATE_B64` es inválido.
+
+**`AUTH_STATE_B64` inválido.** El editor de variables puede partir el base64 en
+varias líneas o recortarlo. Los saltos de línea y espacios ya se limpian
+automáticamente, pero un valor truncado se rechaza con un mensaje explícito.
+Vuelve a generarlo con `npm run auth:export` y pega el contenido completo.
 
 ## Alertas
 
