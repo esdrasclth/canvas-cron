@@ -49,6 +49,56 @@ async function seedAuthState() {
   return false;
 }
 
+// Valida que el contenido sea un storageState de Playwright utilizable, sin
+// aceptar un JSON cualquiera que luego rompa la revision.
+function parseAuthState(text) {
+  let state;
+  try {
+    state = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`El archivo no es JSON válido (${error.message}).`);
+  }
+  if (!state || typeof state !== 'object' || !Array.isArray(state.cookies)) {
+    throw new Error('El archivo no parece una sesión de Playwright: falta el arreglo "cookies".');
+  }
+  if (!state.cookies.length) throw new Error('La sesión no contiene ninguna cookie.');
+  return state;
+}
+
+function summarizeAuthState(state, now = new Date()) {
+  const seconds = now.getTime() / 1000;
+  const withExpiry = state.cookies.filter((cookie) => Number(cookie.expires) > 0);
+  const future = withExpiry
+    .filter((cookie) => Number(cookie.expires) > seconds)
+    .sort((a, b) => a.expires - b.expires);
+
+  return {
+    cookies: state.cookies.length,
+    sessionOnly: state.cookies.length - withExpiry.length,
+    expired: withExpiry.length - future.length,
+    // La primera en caducar marca cuanto le queda de vida util a la sesion.
+    earliestExpiry: future.length ? new Date(future[0].expires * 1000) : null,
+    earliestExpiryName: future.length ? future[0].name : null,
+  };
+}
+
+async function readAuthState() {
+  if (!await exists(config.authFile)) return null;
+  return parseAuthState(await fs.readFile(config.authFile, 'utf8'));
+}
+
+// Reemplaza la sesion guardando antes una copia, para poder volver atras si el
+// archivo nuevo resulta inservible.
+async function installAuthState(text) {
+  const state = parseAuthState(text);
+  await ensureDataDirectories();
+  if (await exists(config.authFile)) {
+    await fs.copyFile(config.authFile, `${config.authFile}.previous`).catch(() => {});
+  }
+  await fs.writeFile(config.authFile, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
+  return summarizeAuthState(state);
+}
+
 async function writeJsonAtomic(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
@@ -56,5 +106,15 @@ async function writeJsonAtomic(file, value) {
   await fs.rename(temporary, file);
 }
 
-module.exports = { decodeAuthState, ensureDataDirectories, exists, seedAuthState, writeJsonAtomic };
+module.exports = {
+  decodeAuthState,
+  ensureDataDirectories,
+  exists,
+  installAuthState,
+  parseAuthState,
+  readAuthState,
+  seedAuthState,
+  summarizeAuthState,
+  writeJsonAtomic,
+};
 

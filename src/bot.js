@@ -1,18 +1,28 @@
 const fs = require('node:fs');
 const config = require('./config');
 const {
-  buildDigest, buildGroupedList, dueBucket, formatDate, relativeTime,
+  buildAnnouncementsList, buildDigest, buildGradesList, buildGroupedList, buildWeeklyDigest, dueBucket,
+  formatDate, inQuietHours, relativeTime,
 } = require('./notifications');
-const { escapeHtml, getUpdates, sendTelegramMessage, setMyCommands } = require('./telegram');
+const { installAuthState, readAuthState, summarizeAuthState } = require('./storage');
+const {
+  answerCallbackQuery, clearKeyboard, downloadFile, escapeHtml, getUpdates,
+  sendTelegramMessage, setMyCommands,
+} = require('./telegram');
 
 const COMMANDS = [
   { command: 'tareas', description: 'Todas las actividades pendientes' },
   { command: 'hoy', description: 'Lo que vence hoy' },
   { command: 'semana', description: 'Los próximos 7 días' },
   { command: 'vencidas', description: 'Actividades ya vencidas' },
+  { command: 'notas', description: 'Calificaciones recientes' },
+  { command: 'anuncios', description: 'Anuncios recientes de los cursos' },
   { command: 'resumen', description: 'El resumen diario, ahora mismo' },
+  { command: 'repaso', description: 'El repaso semanal con los puntos en juego' },
   { command: 'revisar', description: 'Consultar Canvas en este momento' },
-  { command: 'estado', description: 'Estado del monitor y la sesión' },
+  { command: 'sesion', description: 'Estado de la sesión y cómo renovarla' },
+  { command: 'silenciar', description: 'Silenciar o reactivar un curso' },
+  { command: 'estado', description: 'Estado del monitor' },
   { command: 'ayuda', description: 'Ver los comandos disponibles' },
 ];
 
@@ -21,11 +31,19 @@ function helpText() {
     '🤖 <b>Monitor de Canvas CEUTEC</b>',
     '',
     'Reviso Canvas cada 30 minutos y aviso cuando hay novedades.',
-    `El resumen diario sale a las ${String(config.digestHour).padStart(2, '0')}:00.`,
+    `Resumen diario a las ${String(config.digestHour).padStart(2, '0')}:00 y repaso semanal los domingos.`,
     '',
     '<b>Comandos</b>',
   ];
   for (const { command, description } of COMMANDS) lines.push(`/${command} — ${description}`);
+  lines.push(
+    '',
+    '<b>Botones de cada aviso</b>',
+    '✅ <i>Ya la entregué</i> deja de insistir con esa actividad.',
+    '⏰ <i>Recordar en 2 h</i> la aplaza y vuelve a avisarte luego.',
+    '',
+    'Para renovar la sesión, envíame el archivo <code>unitec.json</code> como documento.',
+  );
   return lines.join('\n');
 }
 
@@ -59,34 +77,87 @@ function listCommand({ header, empty, filter }) {
   };
 }
 
+function knownCourses(database) {
+  return [...new Set([
+    ...database.listActiveTasks().map((task) => task.course),
+    ...database.listGradedSubmissions(200).map((row) => row.course),
+    ...database.listRecentAnnouncements(200).map((row) => row.course),
+  ])].sort();
+}
+
 async function statusCommand() {
   const now = new Date();
+  const session = await readAuthState().then((state) => (state ? summarizeAuthState(state, now) : null));
+
   return withDatabase((database) => {
     const tasks = database.listActiveTasks();
     const lastSuccess = database.getState('last_success_at');
     const lastError = database.getState('last_error');
-    const sessionReady = fs.existsSync(config.authFile);
+    const muted = database.listMutedCourses();
+    const snoozed = database.listSnoozedTasks().length;
     const counts = tasks.reduce((acc, task) => {
       const bucket = dueBucket(task, now);
       acc[bucket] = (acc[bucket] || 0) + 1;
       return acc;
     }, {});
 
+    const quiet = config.quietHours
+      ? `${String(config.quietHours.start).padStart(2, '0')}:00–${String(config.quietHours.end).padStart(2, '0')}:00${inQuietHours(now) ? ' (activo ahora)' : ''}`
+      : 'desactivadas';
+
     return [
       '⚙️ <b>Estado del monitor</b>',
       '',
-      `Sesión de UNITEC: ${sessionReady ? '✅ activa' : '❌ falta renovarla'}`,
-      `Avisos por Telegram: ${config.telegramDryRun ? '🔇 simulación' : '🔔 activos'}`,
+      `Sesión de UNITEC: ${fs.existsSync(config.authFile) ? '✅ activa' : '❌ falta renovarla'}`,
+      session?.earliestExpiry
+        ? `Caduca: ${escapeHtml(formatDate(session.earliestExpiry))} (${escapeHtml(relativeTime(session.earliestExpiry, now))})`
+        : null,
+      `Avisos: ${config.telegramDryRun ? '🔇 simulación' : '🔔 activos'}`,
       `Última revisión: ${lastSuccess ? `${escapeHtml(formatDate(lastSuccess))} (${escapeHtml(relativeTime(lastSuccess, now))})` : 'ninguna'}`,
       lastError ? `Último error: ${escapeHtml(lastError.slice(0, 200))}` : 'Sin errores registrados',
       '',
       `Pendientes: <b>${tasks.length}</b>`,
       `Vencidas ${counts.overdue || 0} · hoy ${counts.today || 0} · mañana ${counts.tomorrow || 0} · esta semana ${counts.week || 0} · después ${counts.later || 0}`,
+      `Calificaciones guardadas: ${database.listGradedSubmissions(500).length}`,
+      `Anuncios guardados: ${database.listRecentAnnouncements(500).length}`,
+      snoozed ? `Aplazadas: ${snoozed}` : null,
+      muted.length ? `Cursos silenciados: ${escapeHtml(muted.join(', '))}` : 'Ningún curso silenciado',
       '',
       `Resumen diario: ${String(config.digestHour).padStart(2, '0')}:00 (${escapeHtml(config.timezone)})`,
+      `Repaso semanal: domingo ${String(config.weeklyDigestHour).padStart(2, '0')}:00`,
       `Recordatorios: ${config.reminderHours.join(', ')} h antes de vencer`,
-    ].join('\n');
+      `Horas de silencio: ${escapeHtml(quiet)}`,
+    ].filter((line) => line !== null).join('\n');
   });
+}
+
+async function sessionCommand() {
+  const now = new Date();
+  const state = await readAuthState();
+  if (!state) {
+    return [
+      '🔐 <b>Sin sesión guardada</b>',
+      '',
+      'Ejecuta <code>npm run portal</code> en tu computadora, inicia sesión y envíame',
+      'el archivo <code>playwright/.auth/unitec.json</code> como documento en este chat.',
+    ].join('\n');
+  }
+
+  const summary = summarizeAuthState(state, now);
+  return [
+    '🔐 <b>Sesión de Canvas</b>',
+    '',
+    `${summary.cookies} cookies · ${summary.sessionOnly} de sesión · ${summary.expired} caducadas`,
+    summary.earliestExpiry
+      ? `Primera en caducar: <b>${escapeHtml(formatDate(summary.earliestExpiry))}</b> (${escapeHtml(relativeTime(summary.earliestExpiry, now))})`
+      : 'Ninguna cookie con fecha futura: la sesión depende de cookies de sesión.',
+    '',
+    '<b>Para renovarla</b>',
+    '1. <code>npm run portal</code> en tu computadora e inicia sesión.',
+    '2. Envíame <code>playwright/.auth/unitec.json</code> como documento aquí.',
+    '',
+    'La instalo, guardo una copia de la anterior y la pruebo contra Canvas.',
+  ].filter(Boolean).join('\n');
 }
 
 async function checkCommand() {
@@ -101,10 +172,62 @@ async function checkCommand() {
     '',
     `Pendientes: <b>${summary.pendingTasks}</b>`,
     `Avisos enviados: ${summary.alertsDelivered}`,
-    summary.digestSent ? 'Resumen diario enviado.' : null,
+    summary.alertsHeldForQuietHours ? `Retenidos por horas de silencio: ${summary.alertsHeldForQuietHours}` : null,
+    summary.gradeAlerts ? `Calificaciones nuevas: ${summary.gradeAlerts}` : null,
+    summary.announcementAlerts ? `Anuncios nuevos: ${summary.announcementAlerts}` : null,
     '',
-    '<i>Usa /tareas para ver el detalle.</i>',
+    '<i>Usa /tareas, /notas o /anuncios para ver el detalle.</i>',
   ].filter(Boolean).join('\n');
+}
+
+function muteCommand(args) {
+  const now = new Date().toISOString();
+  return withDatabase((database) => {
+    const muted = database.listMutedCourses();
+    const courses = knownCourses(database);
+
+    if (!args) {
+      const lines = ['🔕 <b>Silenciar un curso</b>', '', 'Uso: <code>/silenciar Programación</code>', ''];
+      if (muted.length) {
+        lines.push('<b>Silenciados ahora</b>');
+        for (const course of muted) lines.push(`• ${escapeHtml(course)} — <code>/activar ${escapeHtml(course)}</code>`);
+        lines.push('');
+      }
+      lines.push('<b>Cursos conocidos</b>');
+      for (const course of courses) lines.push(`• ${escapeHtml(course)}`);
+      return lines.join('\n');
+    }
+
+    const matches = courses.filter((course) => course.toLowerCase().includes(args.toLowerCase()));
+    if (!matches.length) {
+      return `No encontré un curso que contenga «${escapeHtml(args)}».\n\nUsa /silenciar sin texto para ver la lista.`;
+    }
+    if (matches.length > 1) {
+      return [`«${escapeHtml(args)}» coincide con varios cursos:`, '', ...matches.map((c) => `• ${escapeHtml(c)}`), '', 'Sé más específico.'].join('\n');
+    }
+
+    database.muteCourse(matches[0], now);
+    return `🔕 Silenciado <b>${escapeHtml(matches[0])}</b>.\n\nNo te avisaré de sus actividades, calificaciones ni anuncios. Para revertirlo: <code>/activar ${escapeHtml(matches[0])}</code>`;
+  });
+}
+
+function unmuteCommand(args) {
+  return withDatabase((database) => {
+    const muted = database.listMutedCourses();
+    if (!muted.length) return 'No hay ningún curso silenciado.';
+    if (!args) {
+      return ['🔔 <b>Reactivar un curso</b>', '', ...muted.map((c) => `• <code>/activar ${escapeHtml(c)}</code>`)].join('\n');
+    }
+
+    const matches = muted.filter((course) => course.toLowerCase().includes(args.toLowerCase()));
+    if (!matches.length) return `Ningún curso silenciado contiene «${escapeHtml(args)}».`;
+    if (matches.length > 1) {
+      return [`«${escapeHtml(args)}» coincide con varios:`, '', ...matches.map((c) => `• ${escapeHtml(c)}`)].join('\n');
+    }
+
+    database.unmuteCourse(matches[0]);
+    return `🔔 Reactivado <b>${escapeHtml(matches[0])}</b>.`;
+  });
 }
 
 const HANDLERS = {
@@ -130,11 +253,26 @@ const HANDLERS = {
     empty: '✅ <b>Ninguna vencida</b>',
     filter: (task, now) => dueBucket(task, now) === 'overdue',
   }),
+  notas: async () => {
+    const now = new Date();
+    return withDatabase((database) => buildGradesList(database.listGradedSubmissions(15), now));
+  },
+  anuncios: async () => {
+    const now = new Date();
+    return withDatabase((database) => buildAnnouncementsList(database.listRecentAnnouncements(8), now));
+  },
   resumen: async () => {
     const now = new Date();
     return withDatabase((database) => buildDigest(database.listActiveTasks(), now));
   },
+  repaso: async () => {
+    const now = new Date();
+    return withDatabase((database) => buildWeeklyDigest(database.listActiveTasks(), now));
+  },
   revisar: checkCommand,
+  sesion: sessionCommand,
+  silenciar: async (args) => muteCommand(args),
+  activar: async (args) => unmuteCommand(args),
   estado: statusCommand,
 };
 
@@ -143,10 +281,115 @@ function parseCommand(text) {
   return match ? match[1].toLowerCase() : null;
 }
 
+function parseArgs(text) {
+  const trimmed = String(text || '').trim();
+  const space = trimmed.indexOf(' ');
+  return space === -1 ? '' : trimmed.slice(space + 1).trim();
+}
+
+// Las claves de tarea llevan dos puntos (curso:actividad), asi que los minutos
+// se leen desde el final en vez de partir por el primer separador.
+function parseCallbackData(data) {
+  const text = String(data || '');
+  if (text.startsWith('done:')) {
+    const taskKey = text.slice('done:'.length);
+    return taskKey ? { action: 'done', taskKey } : null;
+  }
+  if (text.startsWith('snooze:')) {
+    const rest = text.slice('snooze:'.length);
+    const separator = rest.lastIndexOf(':');
+    if (separator <= 0) return null;
+    const minutes = Number(rest.slice(separator + 1));
+    if (!Number.isFinite(minutes) || minutes <= 0) return null;
+    return { action: 'snooze', taskKey: rest.slice(0, separator), minutes };
+  }
+  return null;
+}
+
+function isAuthorized(chatId) {
+  return String(chatId) === String(config.telegramChatId);
+}
+
+async function handleDocument(message) {
+  const document = message.document;
+  const name = document.file_name || '';
+  if (!/\.json$/i.test(name) && document.mime_type !== 'application/json') {
+    await sendTelegramMessage('Solo entiendo el archivo <code>unitec.json</code> de la sesión de Canvas.');
+    return;
+  }
+
+  try {
+    const buffer = await downloadFile(document.file_id);
+    const summary = await installAuthState(buffer.toString('utf8'));
+
+    // Se prueba contra Canvas antes de dar la sesión por buena.
+    let verification;
+    try {
+      const { getPendingTasks } = require('./canvas');
+      const result = await getPendingTasks();
+      verification = `✅ Probada contra Canvas: ${result.tasks.length} pendientes.`;
+    } catch (error) {
+      verification = `⚠️ Se instaló, pero Canvas la rechazó: ${escapeHtml(error.message)}\nLa anterior quedó como <code>unitec.json.previous</code>.`;
+    }
+
+    await sendTelegramMessage([
+      '🔐 <b>Sesión actualizada</b>',
+      '',
+      `${summary.cookies} cookies instaladas.`,
+      summary.earliestExpiry
+        ? `Primera en caducar ${escapeHtml(relativeTime(summary.earliestExpiry, new Date()))}.`
+        : 'Sin cookies con fecha de caducidad.',
+      '',
+      verification,
+    ].join('\n'));
+  } catch (error) {
+    await sendTelegramMessage([
+      '⚠️ <b>No pude usar ese archivo</b>',
+      '',
+      escapeHtml(error.message),
+      '',
+      'Debe ser el <code>unitec.json</code> que genera <code>npm run portal</code>.',
+    ].join('\n'));
+  }
+}
+
+async function handleCallback(query) {
+  if (!isAuthorized(query.message?.chat?.id)) return;
+
+  const parsed = parseCallbackData(query.data);
+  if (!parsed) {
+    await answerCallbackQuery(query.id, 'No entendí ese botón.').catch(() => {});
+    return;
+  }
+
+  const now = new Date();
+  const iso = now.toISOString();
+  let notice;
+
+  if (parsed.action === 'done') {
+    withDatabase((database) => database.markTaskDone(parsed.taskKey, iso));
+    notice = 'Listo: no te vuelvo a avisar de esta actividad.';
+  } else {
+    const until = new Date(now.getTime() + parsed.minutes * 60_000);
+    withDatabase((database) => database.snoozeTask(parsed.taskKey, until.toISOString(), iso));
+    notice = `Aplazada: te recuerdo ${relativeTime(until, now)}.`;
+  }
+
+  await answerCallbackQuery(query.id, notice).catch(() => {});
+  // Sin botones el aviso queda visualmente resuelto.
+  await clearKeyboard(query.message.chat.id, query.message.message_id).catch(() => {});
+  await sendTelegramMessage(`${parsed.action === 'done' ? '✅' : '⏰'} ${escapeHtml(notice)}`);
+}
+
 async function handleMessage(message) {
   // Solo responde al chat configurado: el bot es personal y su enlace es publico.
-  if (String(message.chat?.id) !== String(config.telegramChatId)) {
+  if (!isAuthorized(message.chat?.id)) {
     console.log(`Mensaje ignorado de un chat no autorizado: ${message.chat?.id}`);
+    return;
+  }
+
+  if (message.document) {
+    await handleDocument(message);
     return;
   }
 
@@ -160,7 +403,7 @@ async function handleMessage(message) {
   }
 
   try {
-    await sendTelegramMessage(await handler());
+    await sendTelegramMessage(await handler(parseArgs(message.text)));
   } catch (error) {
     console.error(`Falló /${command}:`, error.message);
     await sendTelegramMessage(
@@ -178,14 +421,62 @@ async function pollOnce() {
     // falle no se reintente en bucle en cada vuelta.
     withDatabase((database) => database.setState('telegram_offset', String(update.update_id + 1)));
     if (update.message) await handleMessage(update.message);
+    else if (update.callback_query) await handleCallback(update.callback_query);
   }
   return updates.length;
+}
+
+// Vigila que las revisiones sigan ocurriendo: el contenedor puede estar en pie
+// mientras la tarea programada dejó de correr, y eso antes pasaba inadvertido.
+async function checkHeartbeat(now = new Date()) {
+  const state = withDatabase((database) => ({
+    lastSuccess: database.getState('last_success_at'),
+    alertedAt: database.getState('heartbeat_alert_at'),
+  }));
+  if (!state.lastSuccess) return 'sin-datos';
+
+  const staleMinutes = (now - new Date(state.lastSuccess)) / 60_000;
+
+  if (staleMinutes < config.heartbeatMinutes) {
+    if (!state.alertedAt) return 'ok';
+    withDatabase((database) => database.setState('heartbeat_alert_at', ''));
+    await sendTelegramMessage([
+      '✅ <b>El monitor volvió a funcionar</b>',
+      '',
+      `Última revisión ${escapeHtml(relativeTime(state.lastSuccess, now))}.`,
+    ].join('\n'));
+    return 'recuperado';
+  }
+
+  if (inQuietHours(now)) return 'silencio';
+  // Una advertencia cada 6 horas mientras siga caído.
+  if (state.alertedAt && (now - new Date(state.alertedAt)) < 6 * 3_600_000) return 'ya-avisado';
+
+  await sendTelegramMessage([
+    '⚠️ <b>El monitor dejó de revisar</b>',
+    '',
+    `La última revisión correcta fue ${escapeHtml(relativeTime(state.lastSuccess, now))}.`,
+    `Lo esperado es una cada 30 minutos.`,
+    '',
+    'Revisa la tarea programada en Dokploy, o usa /revisar para forzar una ahora.',
+  ].join('\n'));
+  withDatabase((database) => database.setState('heartbeat_alert_at', now.toISOString()));
+  return 'avisado';
+}
+
+function startHeartbeat(intervalMs = 10 * 60_000) {
+  const timer = setInterval(() => {
+    checkHeartbeat().catch((error) => console.error(`Latido falló: ${error.message}`));
+  }, intervalMs);
+  timer.unref?.();
+  return timer;
 }
 
 async function startBot() {
   await setMyCommands(COMMANDS).catch((error) => {
     console.error(`No se pudo registrar el menú de comandos: ${error.message}`);
   });
+  startHeartbeat();
   console.log('Bot de Telegram escuchando comandos.');
 
   let backoffMs = 1_000;
@@ -201,4 +492,16 @@ async function startBot() {
   }
 }
 
-module.exports = { COMMANDS, handleMessage, helpText, parseCommand, pollOnce, startBot };
+module.exports = {
+  COMMANDS,
+  checkHeartbeat,
+  handleCallback,
+  handleMessage,
+  helpText,
+  parseArgs,
+  parseCallbackData,
+  parseCommand,
+  pollOnce,
+  startBot,
+  startHeartbeat,
+};

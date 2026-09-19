@@ -1,12 +1,19 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const config = require('./config');
-const { AuthenticationRequiredError, getPendingTasks } = require('./canvas');
+const {
+  AuthenticationRequiredError, getAnnouncements, getGradedSubmissions, getPendingTasks,
+} = require('./canvas');
 const { openDatabase } = require('./database');
-const { buildDigest, buildTaskAlerts, localDateKey, shouldSendDigest } = require('./notifications');
+const {
+  buildAnnouncementAlerts, buildDigest, buildGradeAlerts, buildTaskAlerts, buildWeeklyDigest,
+  htmlToText, inQuietHours, localDateKey, relativeTime, shouldHoldAlert, shouldSendDigest, shouldSendWeekly,
+} = require('./notifications');
 const { refreshSession } = require('./session');
-const { ensureDataDirectories, seedAuthState, writeJsonAtomic } = require('./storage');
-const { sendTelegramMessage } = require('./telegram');
+const {
+  ensureDataDirectories, readAuthState, seedAuthState, summarizeAuthState, writeJsonAtomic,
+} = require('./storage');
+const { escapeHtml, sendTelegramMessage } = require('./telegram');
 
 async function acquireLock() {
   try {
@@ -33,6 +40,115 @@ async function loadTasksWithRefresh() {
   }
 }
 
+// Envía los avisos respetando la ventana de silencio. Lo que se retiene no se
+// registra, así que vuelve a evaluarse en la siguiente revisión; por eso se
+// devuelve aparte, para no darlo por visto al sincronizar.
+async function deliverAlerts(alerts, database, now) {
+  let delivered = 0;
+  let held = 0;
+  const pending = [];
+
+  for (const alert of alerts) {
+    if (shouldHoldAlert(alert, now)) {
+      held += 1;
+      pending.push(alert);
+      continue;
+    }
+
+    const result = await sendTelegramMessage(alert.text, { keyboard: alert.keyboard || null });
+    if (result.dryRun) {
+      pending.push(alert);
+      continue;
+    }
+
+    database.addNotification(alert.key, alert.taskKey, alert.kind, now.toISOString());
+    if (alert.clearSnooze) database.clearSnooze(alert.taskKey, now.toISOString());
+    delivered += 1;
+  }
+
+  return { delivered, held, pending };
+}
+
+// Claves de origen de los avisos de un tipo que no llegaron a salir.
+function pendingKeys(pending, kind) {
+  return new Set(pending.filter((alert) => alert.kind === kind).map((alert) => alert.taskKey));
+}
+
+// Las calificaciones y los anuncios son informacion secundaria: si Canvas
+// falla ahi, la revision de pendientes no debe caerse por eso. Solo se leen y
+// se preparan los avisos; se guardan despues de enviarlos (ver commitUpdates).
+async function loadGrades(database, now) {
+  if (!config.trackGrades) return { items: [], alerts: [] };
+
+  try {
+    const result = await getGradedSubmissions();
+    return { items: result.submissions, alerts: buildGradeAlerts(result.submissions, database, now) };
+  } catch (error) {
+    console.error(`No se pudieron leer las calificaciones: ${error.message}`);
+    return { items: [], alerts: [], error: error.message };
+  }
+}
+
+async function loadAnnouncements(database, now) {
+  if (!config.trackAnnouncements) return { items: [], alerts: [] };
+
+  try {
+    const result = await getAnnouncements();
+    const items = result.announcements.map((item) => ({ ...item, text: htmlToText(item.message) }));
+    return { items, alerts: buildAnnouncementAlerts(items, database, now) };
+  } catch (error) {
+    console.error(`No se pudieron leer los anuncios: ${error.message}`);
+    return { items: [], alerts: [], error: error.message };
+  }
+}
+
+// Lo que quedó retenido (horas de silencio o simulación) no se guarda: si se
+// guardara, la siguiente revisión ya no lo vería como nuevo y el aviso se
+// perdería.
+function commitUpdates(database, grades, announcements, pending, now) {
+  const iso = now.toISOString();
+
+  if (!grades.error && config.trackGrades) {
+    const heldGrades = pendingKeys(pending, 'graded');
+    database.syncSubmissions(grades.items.filter((item) => !heldGrades.has(item.key)), iso);
+    database.setState('grades_initialized', '1');
+  }
+
+  if (!announcements.error && config.trackAnnouncements) {
+    const heldAnnouncements = pendingKeys(pending, 'announcement');
+    database.saveAnnouncements(announcements.items.filter((item) => !heldAnnouncements.has(item.key)), iso);
+    database.setState('announcements_initialized', '1');
+  }
+}
+
+async function warnAboutSession(database, now) {
+  const state = await readAuthState();
+  if (!state) return null;
+
+  const summary = summarizeAuthState(state, now);
+  if (!summary.earliestExpiry) return summary;
+
+  const days = (summary.earliestExpiry - now) / 86_400_000;
+  if (days > config.sessionWarnDays) return summary;
+
+  // Una sola advertencia por día para no repetirla en cada revisión.
+  const key = `session_warn:${localDateKey(now)}`;
+  if (database.hasNotification(key)) return summary;
+
+  const result = await sendTelegramMessage([
+    '🔐 <b>La sesión de Canvas está por caducar</b>',
+    '',
+    `Caduca ${escapeHtml(relativeTime(summary.earliestExpiry, now))}.`,
+    '',
+    'Para renovarla: ejecuta <code>npm run portal</code> en tu computadora, inicia sesión',
+    'y envíame el archivo <code>playwright/.auth/unitec.json</code> como documento en este chat.',
+    'Yo la instalo sin necesidad de tocar Dokploy.',
+  ].join('\n'));
+
+  if (!result.dryRun) database.addNotification(key, null, 'session_expiring', now.toISOString());
+  return summary;
+}
+
 // Ejecuta una revisión completa: consulta Canvas, envía lo que corresponda y
 // deja el estado en SQLite. Devuelve null si otra revisión ya está en curso.
 async function runCheck() {
@@ -45,30 +161,40 @@ async function runCheck() {
   try {
     const now = new Date();
     const result = await loadTasksWithRefresh();
-    const alerts = buildTaskAlerts(result.tasks, database, now);
-    let alertsDelivered = 0;
+    const taskAlerts = buildTaskAlerts(result.tasks, database, now);
+    const grades = await loadGrades(database, now);
+    const announcements = await loadAnnouncements(database, now);
 
-    for (const alert of alerts) {
-      const delivery = await sendTelegramMessage(alert.text);
-      if (!delivery.dryRun) {
-        database.addNotification(alert.key, alert.taskKey, alert.kind, now.toISOString());
-        alertsDelivered += 1;
-      }
-    }
+    const { delivered, held, pending } = await deliverAlerts(
+      [...taskAlerts, ...grades.alerts, ...announcements.alerts], database, now,
+    );
+    commitUpdates(database, grades, announcements, pending, now);
 
     database.syncTasks(result.tasks, now.toISOString());
     const initialized = database.getState('initialized') === '1';
     database.setState('initialized', '1');
 
-    // El resumen sale a la hora configurada haya novedades o no.
+    // Los resúmenes salen a su hora haya novedades o no, pero nunca en silencio.
+    const quiet = inQuietHours(now);
     let digestSent = false;
-    if (shouldSendDigest(database, now) || (!initialized && config.sendStartupDigest)) {
+    if (!quiet && (shouldSendDigest(database, now) || (!initialized && config.sendStartupDigest))) {
       const delivery = await sendTelegramMessage(buildDigest(result.tasks, now));
       if (!delivery.dryRun) {
         database.setState('last_digest_date', localDateKey(now));
         digestSent = true;
       }
     }
+
+    let weeklySent = false;
+    if (!quiet && shouldSendWeekly(database, now)) {
+      const delivery = await sendTelegramMessage(buildWeeklyDigest(result.tasks, now));
+      if (!delivery.dryRun) {
+        database.setState('last_weekly_date', localDateKey(now));
+        weeklySent = true;
+      }
+    }
+
+    const session = await warnAboutSession(database, now);
 
     await writeJsonAtomic(path.join(config.outputDir, 'pending-tasks.json'), result.tasks);
     database.setState('last_success_at', now.toISOString());
@@ -78,9 +204,16 @@ async function runCheck() {
       checkedAt: now.toISOString(),
       plannerItems: result.plannerItems,
       pendingTasks: result.tasks.length,
-      alertsPrepared: alerts.length,
-      alertsDelivered,
+      gradedTracked: grades.items.length,
+      gradeAlerts: grades.alerts.length,
+      announcementsTracked: announcements.items.length,
+      announcementAlerts: announcements.alerts.length,
+      alertsPrepared: taskAlerts.length + grades.alerts.length + announcements.alerts.length,
+      alertsDelivered: delivered,
+      alertsHeldForQuietHours: held,
       digestSent,
+      weeklySent,
+      sessionExpiresAt: session?.earliestExpiry ? session.earliestExpiry.toISOString() : null,
       dryRun: config.telegramDryRun,
     };
   } catch (error) {
@@ -91,7 +224,9 @@ async function runCheck() {
         '⚠️ <b>El monitor de Canvas necesita atención</b>',
         error.code === 'INTERACTION_REQUIRED'
           ? 'Microsoft solicitó una intervención manual para renovar la sesión.'
-          : `Error: ${String(error.message).slice(0, 500)}`,
+          : `Error: ${escapeHtml(String(error.message).slice(0, 500))}`,
+        '',
+        'Si es la sesión, envíame el archivo <code>unitec.json</code> como documento y la instalo.',
       ].join('\n')).catch((telegramError) => console.error(telegramError.message));
       database.setState('last_error', errorKey);
     }

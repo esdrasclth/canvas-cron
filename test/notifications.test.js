@@ -2,11 +2,21 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { buildTaskAlerts } = require('../src/notifications');
 
-function fakeDatabase({ initialized = true, task = null, sent = [] } = {}) {
+function fakeDatabase({
+  initialized = true, task = null, sent = [], muted = [], action = null, submission = null,
+  gradesInitialized = true,
+} = {}) {
   return {
-    getState: (key) => key === 'initialized' && initialized ? '1' : null,
+    getState: (key) => {
+      if (key === 'initialized') return initialized ? '1' : null;
+      if (key === 'grades_initialized') return gradesInitialized ? '1' : null;
+      return null;
+    },
     getTask: () => task,
     hasNotification: (key) => sent.includes(key),
+    listMutedCourses: () => muted,
+    getTaskAction: () => action,
+    getSubmission: () => submission,
   };
 }
 
