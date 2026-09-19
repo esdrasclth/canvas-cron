@@ -365,17 +365,11 @@ async function handleDocument(message) {
 
   try {
     const buffer = await downloadFile(document.file_id);
-    const summary = await installAuthState(buffer.toString('utf8'));
-
-    // Se prueba contra Canvas antes de dar la sesión por buena.
-    let verification;
-    try {
-      const { getPendingTasks } = require('./canvas');
-      const result = await getPendingTasks();
-      verification = `✅ Probada contra Canvas: ${result.tasks.length} pendientes.`;
-    } catch (error) {
-      verification = `⚠️ Se instaló, pero Canvas la rechazó: ${escapeHtml(error.message)}\nLa anterior quedó como <code>unitec.json.previous</code>.`;
-    }
+    const { getPendingTasks } = require('./canvas');
+    const summary = await installAuthState(buffer.toString('utf8'), {
+      verify: (candidate) => getPendingTasks({ authFile: candidate }),
+    });
+    const verification = `✅ Probada contra Canvas: ${summary.verification.tasks.length} pendientes.`;
 
     await sendTelegramMessage([
       '🔐 <b>Sesión actualizada</b>',
@@ -393,7 +387,7 @@ async function handleDocument(message) {
       '',
       escapeHtml(error.message),
       '',
-      'Debe ser el <code>unitec.json</code> que genera <code>npm run portal</code>.',
+      'La sesión activa no fue reemplazada. Debe ser el <code>unitec.json</code> que genera <code>npm run portal</code>.',
     ].join('\n'));
   }
 }
@@ -457,16 +451,30 @@ async function handleMessage(message) {
   }
 }
 
-async function pollOnce() {
+async function pollOnce({
+  fetchUpdates = getUpdates,
+  onMessage = handleMessage,
+  onCallback = handleCallback,
+} = {}) {
   const offset = withDatabase((database) => Number(database.getState('telegram_offset') || 0));
-  const updates = await getUpdates(offset, config.pollTimeoutSeconds);
+  const updates = await fetchUpdates(offset, config.pollTimeoutSeconds);
 
   for (const update of updates) {
-    // El offset se guarda antes de atender el mensaje para que un comando que
-    // falle no se reintente en bucle en cada vuelta.
-    withDatabase((database) => database.setState('telegram_offset', String(update.update_id + 1)));
-    if (update.message) await handleMessage(update.message);
-    else if (update.callback_query) await handleCallback(update.callback_query);
+    // El offset avanza solo despues de completar el handler. Si el proceso cae
+    // a mitad, Telegram vuelve a entregar el update en vez de perderlo.
+    if (update.message) await onMessage(update.message);
+    else if (update.callback_query) await onCallback(update.callback_query);
+    withDatabase((database) => {
+      database.setState('telegram_offset', String(update.update_id + 1));
+      database.setState('telegram_last_poll_at', new Date().toISOString());
+      database.setState('telegram_last_poll_error', '');
+    });
+  }
+  if (!updates.length) {
+    withDatabase((database) => {
+      database.setState('telegram_last_poll_at', new Date().toISOString());
+      database.setState('telegram_last_poll_error', '');
+    });
   }
   return updates.length;
 }
@@ -531,6 +539,9 @@ async function startBot() {
       backoffMs = 1_000;
     } catch (error) {
       console.error(`Error al consultar Telegram: ${error.message}`);
+      withDatabase((database) => database.setState(
+        'telegram_last_poll_error', `${new Date().toISOString()} ${error.message}`.slice(0, 500),
+      ));
       await new Promise((resolve) => setTimeout(resolve, backoffMs));
       backoffMs = Math.min(backoffMs * 2, 60_000);
     }

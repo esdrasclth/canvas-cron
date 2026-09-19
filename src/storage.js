@@ -1,5 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const config = require('./config');
 
 async function exists(file) {
@@ -12,6 +13,42 @@ async function ensureDataDirectories() {
     fs.mkdir(config.profileDir, { recursive: true }),
     fs.mkdir(config.outputDir, { recursive: true }),
   ]);
+}
+
+async function replaceFile(temporary, target) {
+  try {
+    await fs.rename(temporary, target);
+  } catch (error) {
+    // POSIX reemplaza el destino atomicamente. Windows puede rechazarlo si ya
+    // existe: se aparta el actual y se restaura si el segundo rename falla.
+    if (!['EEXIST', 'EPERM'].includes(error.code)) throw error;
+    const displaced = `${target}.${randomUUID()}.replaced`;
+    let hasDisplaced = false;
+    try {
+      await fs.rename(target, displaced);
+      hasDisplaced = true;
+    } catch (moveError) {
+      if (moveError.code !== 'ENOENT') throw moveError;
+    }
+    try {
+      await fs.rename(temporary, target);
+    } catch (replaceError) {
+      if (hasDisplaced) await fs.rename(displaced, target).catch(() => {});
+      throw replaceError;
+    }
+    if (hasDisplaced) await fs.unlink(displaced).catch(() => {});
+  }
+}
+
+async function writeFileAtomic(file, contents, options = 'utf8') {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, contents, options);
+    await replaceFile(temporary, file);
+  } finally {
+    await fs.unlink(temporary).catch(() => {});
+  }
 }
 
 function decodeAuthState(raw) {
@@ -36,13 +73,15 @@ async function seedAuthState() {
 
   if (process.env.AUTH_STATE_B64) {
     const decoded = decodeAuthState(process.env.AUTH_STATE_B64);
-    await fs.writeFile(config.authFile, decoded, { encoding: 'utf8', mode: 0o600 });
+    const state = parseAuthState(decoded);
+    await writeFileAtomic(config.authFile, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
     return true;
   }
 
   const localAuth = path.resolve('playwright/.auth/unitec.json');
   if (localAuth !== config.authFile && await exists(localAuth)) {
-    await fs.copyFile(localAuth, config.authFile);
+    const state = parseAuthState(await fs.readFile(localAuth, 'utf8'));
+    await writeFileAtomic(config.authFile, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
     return true;
   }
 
@@ -87,23 +126,39 @@ async function readAuthState() {
   return parseAuthState(await fs.readFile(config.authFile, 'utf8'));
 }
 
-// Reemplaza la sesion guardando antes una copia, para poder volver atras si el
-// archivo nuevo resulta inservible.
-async function installAuthState(text) {
+// La sesion nueva se escribe como candidata y se verifica antes de tocar la
+// activa. Solo una candidata valida reemplaza el archivo actual.
+async function installAuthState(text, { verify } = {}) {
   const state = parseAuthState(text);
   await ensureDataDirectories();
-  if (await exists(config.authFile)) {
-    await fs.copyFile(config.authFile, `${config.authFile}.previous`).catch(() => {});
+  const candidate = `${config.authFile}.${randomUUID()}.candidate`;
+  let verification = null;
+
+  try {
+    await fs.writeFile(candidate, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
+    if (verify) verification = await verify(candidate);
+
+    if (await exists(config.authFile)) {
+      const previous = await fs.readFile(config.authFile);
+      await writeFileAtomic(`${config.authFile}.previous`, previous, { mode: 0o600 });
+    }
+    await replaceFile(candidate, config.authFile);
+  } catch (error) {
+    // Si el fallback de Windows retiro el destino antes de fallar, se recupera
+    // la copia anterior. En el camino normal la sesion activa nunca se toco.
+    if (!await exists(config.authFile) && await exists(`${config.authFile}.previous`)) {
+      await fs.copyFile(`${config.authFile}.previous`, config.authFile).catch(() => {});
+    }
+    throw error;
+  } finally {
+    await fs.unlink(candidate).catch(() => {});
   }
-  await fs.writeFile(config.authFile, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
-  return summarizeAuthState(state);
+
+  return { ...summarizeAuthState(state), verification };
 }
 
 async function writeJsonAtomic(file, value) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${process.pid}.tmp`;
-  await fs.writeFile(temporary, JSON.stringify(value, null, 2), 'utf8');
-  await fs.rename(temporary, file);
+  await writeFileAtomic(file, JSON.stringify(value, null, 2), 'utf8');
 }
 
 module.exports = {
@@ -115,6 +170,7 @@ module.exports = {
   readAuthState,
   seedAuthState,
   summarizeAuthState,
+  writeFileAtomic,
   writeJsonAtomic,
 };
 

@@ -1,5 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const config = require('./config');
 const {
   AuthenticationRequiredError, getAnnouncements, getGradedSubmissions, getPendingTasks,
@@ -15,17 +16,72 @@ const {
 } = require('./storage');
 const { escapeHtml, sendTelegramMessage } = require('./telegram');
 
+async function ownsLock(token) {
+  try {
+    return JSON.parse(await fs.readFile(config.lockFile, 'utf8')).token === token;
+  } catch {
+    return false;
+  }
+}
+
+async function createLock() {
+  const token = randomUUID();
+  const handle = await fs.open(config.lockFile, 'wx');
+  let writeError = null;
+  try {
+    await handle.writeFile(JSON.stringify({ token, pid: process.pid, createdAt: new Date().toISOString() }));
+  } catch (error) {
+    writeError = error;
+  } finally {
+    await handle.close();
+  }
+  if (writeError) {
+    await fs.unlink(config.lockFile).catch(() => {});
+    throw writeError;
+  }
+
+  const heartbeatMs = Math.max(10_000, Math.min(config.lockStaleMinutes * 30_000, 60_000));
+  const heartbeat = setInterval(async () => {
+    if (!await ownsLock(token)) return;
+    const now = new Date();
+    await fs.utimes(config.lockFile, now, now).catch(() => {});
+  }, heartbeatMs);
+  heartbeat.unref?.();
+
+  return {
+    token,
+    async release() {
+      clearInterval(heartbeat);
+      if (await ownsLock(token)) await fs.unlink(config.lockFile).catch(() => {});
+    },
+  };
+}
+
 async function acquireLock() {
   try {
-    return await fs.open(config.lockFile, 'wx');
+    return await createLock();
   } catch (error) {
     if (error.code !== 'EEXIST') throw error;
     const stats = await fs.stat(config.lockFile).catch(() => null);
-    if (stats && Date.now() - stats.mtimeMs > 20 * 60_000) {
-      await fs.unlink(config.lockFile).catch(() => {});
-      return fs.open(config.lockFile, 'wx');
+    if (!stats || Date.now() - stats.mtimeMs <= config.lockStaleMinutes * 60_000) return null;
+
+    // Renombrar reclama atomicamente el lock obsoleto. Si otro proceso gano la
+    // carrera, el rename falla y se respeta el lock nuevo que haya creado.
+    const stale = `${config.lockFile}.${randomUUID()}.stale`;
+    try {
+      await fs.rename(config.lockFile, stale);
+    } catch (renameError) {
+      if (['ENOENT', 'EACCES', 'EPERM'].includes(renameError.code)) return null;
+      throw renameError;
     }
-    return null;
+    await fs.unlink(stale).catch(() => {});
+
+    try {
+      return await createLock();
+    } catch (createError) {
+      if (createError.code === 'EEXIST') return null;
+      throw createError;
+    }
   }
 }
 
@@ -40,29 +96,43 @@ async function loadTasksWithRefresh() {
   }
 }
 
-// Envía los avisos respetando la ventana de silencio. Lo que se retiene no se
-// registra, así que vuelve a evaluarse en la siguiente revisión; por eso se
-// devuelve aparte, para no darlo por visto al sincronizar.
-async function deliverAlerts(alerts, database, now) {
+// Persiste primero los avisos y luego intenta entregarlos respetando la ventana
+// de silencio. Lo retenido queda en la outbox para la siguiente revision y se
+// devuelve aparte para no dar notas o anuncios por vistos antes de enviarlos.
+async function deliverAlerts(alerts, database, now, { send = sendTelegramMessage } = {}) {
   let delivered = 0;
   let held = 0;
   const pending = [];
 
-  for (const alert of alerts) {
+  // Se encolan antes de intentar enviar. Aunque el snapshot de tareas se
+  // actualice al final, un aviso retenido sigue existiendo para la proxima
+  // revision.
+  database.enqueueAlerts(alerts, now.toISOString());
+
+  for (const alert of database.listQueuedAlerts()) {
+    if (database.hasNotification(alert.key)) {
+      database.removeQueuedAlert(alert.key);
+      continue;
+    }
     if (shouldHoldAlert(alert, now)) {
       held += 1;
       pending.push(alert);
       continue;
     }
 
-    const result = await sendTelegramMessage(alert.text, { keyboard: alert.keyboard || null });
+    const result = await send(alert.text, {
+      keyboard: alert.keyboard || null,
+      startChunk: alert.outboxNextChunk || 0,
+      onChunkSent: (nextChunk) => database.updateQueuedAlertProgress(
+        alert.key, nextChunk, new Date().toISOString(),
+      ),
+    });
     if (result.dryRun) {
       pending.push(alert);
       continue;
     }
 
-    database.addNotification(alert.key, alert.taskKey, alert.kind, now.toISOString());
-    if (alert.clearSnooze) database.clearSnooze(alert.taskKey, now.toISOString());
+    database.markAlertDelivered(alert, now.toISOString());
     delivered += 1;
   }
 
@@ -267,9 +337,8 @@ async function runCheck() {
     throw error;
   } finally {
     database.close();
-    await lock.close();
-    await fs.unlink(config.lockFile).catch(() => {});
+    await lock.release();
   }
 }
 
-module.exports = { runCheck };
+module.exports = { acquireLock, deliverAlerts, runCheck };

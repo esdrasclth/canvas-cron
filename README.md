@@ -65,6 +65,13 @@ variables desde la sección Environment del servicio.
 | `TRACK_ANNOUNCEMENTS` | `false` desactiva los avisos de anuncios. |
 | `ANNOUNCEMENT_LOOKBACK_DAYS` | Días hacia atrás que se consultan los anuncios, por defecto `14`. |
 | `TELEGRAM_POLL_TIMEOUT` | Segundos de long polling, por defecto `50`. |
+| `TELEGRAM_MAX_RETRIES` | Reintentos ante errores 429/5xx de Telegram, por defecto `3`. |
+| `SQLITE_BUSY_TIMEOUT_MS` | Espera ante una escritura concurrente en SQLite, por defecto `5000`. |
+| `CHECK_LOCK_STALE_MINUTES` | Antigüedad para recuperar un lock sin heartbeat, por defecto `20`. |
+| `CANVAS_REQUEST_TIMEOUT_MS` | Timeout por petición a Canvas, por defecto `30000`. |
+| `CANVAS_MAX_RETRIES` | Reintentos ante errores temporales de Canvas, por defecto `2`. |
+| `CANVAS_MAX_PAGES` | Máximo de páginas antes de abortar una respuesta parcial, por defecto `30`. |
+| `CANVAS_CONCURRENCY` | Máximo de consultas simultáneas a Canvas, por defecto `5`. |
 | `TIMEZONE` | Zona horaria, por defecto `America/Tegucigalpa`. |
 
 ## Configurar Telegram de forma segura
@@ -119,7 +126,9 @@ el motivo, de modo que el `docker exec` del schedule siempre encuentre destino.
 node -e "require('node:http').get('http://127.0.0.1:3000/health',r=>{r.pipe(process.stdout)})"
 ```
 
-- `{"status":"ready"}` — la sesión está cargada y `npm run check` puede ejecutarse.
+- `{"status":"ready"}` — sesión y SQLite válidos; la última revisión no está atrasada.
+- `{"status":"degraded"}` — la última revisión correcta superó `HEARTBEAT_MINUTES`.
+- `{"status":"invalid_session"}` — el archivo existe, pero no es un `storageState` válido.
 - `{"status":"authentication_required","error":"..."}` — falta la sesión; el campo
   `error` indica si `AUTH_STATE_B64` es inválido.
 
@@ -167,9 +176,10 @@ Cuando la sesión caduque no hace falta tocar Dokploy ni redesplegar:
 1. `npm run portal` en tu computadora e inicia sesión.
 2. Envía `playwright/.auth/unitec.json` al bot **como documento**.
 
-El bot valida que sea un `storageState` de Playwright con cookies, guarda la
-anterior como `unitec.json.previous`, instala la nueva y la prueba contra Canvas
-antes de confirmar. Si Canvas la rechaza, lo dice y la copia anterior sigue ahí.
+El bot valida que sea un `storageState` de Playwright con cookies y prueba un
+archivo candidato contra Canvas antes de reemplazar la sesión activa. Solo si la
+prueba funciona guarda la anterior como `unitec.json.previous` e instala la
+nueva; si Canvas la rechaza, la sesión activa queda intacta.
 
 El monitor avisa por su cuenta cuando la primera cookie está a menos de
 `SESSION_WARN_DAYS` de caducar, una sola vez al día.

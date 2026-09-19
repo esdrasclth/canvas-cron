@@ -11,6 +11,15 @@ class AuthenticationRequiredError extends Error {
   }
 }
 
+class CanvasHttpError extends Error {
+  constructor(message, status = null) {
+    super(message);
+    this.name = 'CanvasHttpError';
+    this.code = 'CANVAS_HTTP_ERROR';
+    this.status = status;
+  }
+}
+
 // Con la sesion ya validada (la lista de cursos respondio), un 401/403/404 en
 // un curso concreto significa que ese curso restringe la seccion, no que la
 // sesion caduco: se salta ese curso en vez de perder todos los demas.
@@ -18,24 +27,88 @@ function isCourseRestriction(error) {
   return [401, 403, 404].includes(error?.status);
 }
 
-async function fetchAll(api, firstUrl) {
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function canvasRetryDelay(response, attempt) {
+  const raw = response?.headers?.()['retry-after'];
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  return Math.min(config.canvasRetryBaseMs * (2 ** attempt), 30_000);
+}
+
+async function canvasGet(api, url, {
+  maxRetries = config.canvasMaxRetries,
+  sleep = wait,
+} = {}) {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    let response;
+    try {
+      response = await api.get(url, { timeout: config.canvasRequestTimeoutMs });
+    } catch (error) {
+      if (attempt >= maxRetries) throw new CanvasHttpError(`No se pudo consultar Canvas: ${error.message}`);
+      await sleep(Math.min(config.canvasRetryBaseMs * (2 ** attempt), 30_000));
+      continue;
+    }
+
+    const retryable = response.status() === 429 || response.status() >= 500;
+    if (!retryable || attempt >= maxRetries) return response;
+    await sleep(canvasRetryDelay(response, attempt));
+  }
+  throw new CanvasHttpError('No se pudo consultar Canvas despues de varios intentos.');
+}
+
+function readJsonResponse(response, { courseScoped = false } = {}) {
+  const status = response.status();
+  const contentType = response.headers()['content-type'] || '';
+  if ([401, 403].includes(status)) {
+    if (courseScoped) throw new CanvasHttpError(`Canvas restringio el recurso (HTTP ${status})`, status);
+    throw new AuthenticationRequiredError(undefined, status);
+  }
+  if (!response.ok()) throw new CanvasHttpError(`Canvas respondió HTTP ${status}`, status);
+  if (!contentType.includes('application/json')) {
+    // Una API que responde 200 con HTML suele ser la redireccion al login. Los
+    // errores HTTP con HTML ya se clasificaron arriba como fallos de Canvas.
+    throw new AuthenticationRequiredError('Canvas devolvio la pagina de inicio de sesion', status);
+  }
+  return response.json();
+}
+
+async function fetchAll(api, firstUrl, {
+  courseScoped = false,
+  maxPages = config.canvasMaxPages,
+  requestOptions,
+} = {}) {
   const items = [];
   let nextUrl = firstUrl;
 
-  for (let page = 0; nextUrl && page < 30; page += 1) {
-    const response = await api.get(nextUrl);
-    const contentType = response.headers()['content-type'] || '';
-    if ([401, 403].includes(response.status()) || !contentType.includes('application/json')) {
-      throw new AuthenticationRequiredError(undefined, response.status());
+  for (let page = 0; nextUrl; page += 1) {
+    if (page >= maxPages) {
+      throw new CanvasHttpError(`Canvas excedio el limite de ${maxPages} paginas; se cancelo para no guardar datos parciales.`);
     }
-    if (!response.ok()) {
-      throw Object.assign(new Error(`Canvas respondió HTTP ${response.status()}`), { status: response.status() });
-    }
-    items.push(...await response.json());
+    const response = await canvasGet(api, nextUrl, requestOptions);
+    const pageItems = await readJsonResponse(response, { courseScoped });
+    if (!Array.isArray(pageItems)) throw new CanvasHttpError('Canvas devolvio una pagina JSON con formato inesperado.');
+    items.push(...pageItems);
     nextUrl = response.headers().link?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
   }
 
   return items;
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
 }
 
 function assignmentIdFor(item) {
@@ -55,10 +128,10 @@ function taskStatus(task, now = new Date()) {
   return 'overdue_open';
 }
 
-async function getPendingTasks() {
-  if (!await exists(config.authFile)) throw new AuthenticationRequiredError('No existe una sesión guardada');
+async function getPendingTasks({ authFile = config.authFile } = {}) {
+  if (!await exists(authFile)) throw new AuthenticationRequiredError('No existe una sesión guardada');
 
-  const api = await request.newContext({ storageState: config.authFile });
+  const api = await request.newContext({ storageState: authFile, timeout: config.canvasRequestTimeoutMs });
   try {
     const now = new Date();
     const startDate = new Date(now);
@@ -81,17 +154,15 @@ async function getPendingTasks() {
       .map((item) => ({ item, assignmentId: assignmentIdFor(item) }))
       .filter(({ assignmentId }) => assignmentId != null);
 
-    const checked = await Promise.all(candidates.map(async ({ item, assignmentId }) => {
-      const response = await api.get(
+    const checked = await mapWithConcurrency(candidates, config.canvasConcurrency, async ({ item, assignmentId }) => {
+      const response = await canvasGet(api,
         `${config.canvasOrigin}/api/v1/courses/${item.course_id}/assignments/${assignmentId}/submissions/self`,
       );
-      const contentType = response.headers()['content-type'] || '';
-      if ([401, 403].includes(response.status()) || !contentType.includes('application/json')) {
-        throw new AuthenticationRequiredError();
-      }
-      const submission = response.ok() ? await response.json() : item.submissions;
+      const submission = response.status() === 404
+        ? item.submissions
+        : await readJsonResponse(response);
       return { item, assignmentId, submission };
-    }));
+    });
 
     const tasks = checked
       .filter(({ submission }) => submission.workflow_state === 'unsubmitted' || (
@@ -132,31 +203,31 @@ async function listActiveCourses(api) {
 async function getGradedSubmissions() {
   if (!await exists(config.authFile)) throw new AuthenticationRequiredError('No existe una sesión guardada');
 
-  const api = await request.newContext({ storageState: config.authFile });
+  const api = await request.newContext({ storageState: config.authFile, timeout: config.canvasRequestTimeoutMs });
   try {
     const courses = await listActiveCourses(api);
     const graded = [];
     const skipped = [];
 
-    for (const course of courses) {
+    const courseResults = await mapWithConcurrency(courses, config.canvasConcurrency, async (course) => {
       const url = new URL(`/api/v1/courses/${course.id}/assignments`, config.canvasOrigin);
       url.searchParams.append('include[]', 'submission');
       url.searchParams.set('per_page', '100');
 
       let assignments;
       try {
-        assignments = await fetchAll(api, url.toString());
+        assignments = await fetchAll(api, url.toString(), { courseScoped: true });
       } catch (error) {
         if (!isCourseRestriction(error)) throw error;
-        skipped.push(course.name || `Curso ${course.id}`);
-        continue;
+        return { skipped: course.name || `Curso ${course.id}`, rows: [] };
       }
+      const rows = [];
       for (const assignment of assignments) {
         const submission = assignment.submission;
         if (!submission || !submission.graded_at) continue;
         if (submission.workflow_state === 'unsubmitted' && submission.score == null) continue;
 
-        graded.push({
+        rows.push({
           key: `${course.id}:${assignment.id}`,
           title: assignment.name || '(Sin título)',
           course: course.name || `Curso ${course.id}`,
@@ -169,6 +240,12 @@ async function getGradedSubmissions() {
           gradedAt: submission.graded_at,
         });
       }
+      return { skipped: null, rows };
+    });
+
+    for (const result of courseResults) {
+      if (result.skipped) skipped.push(result.skipped);
+      graded.push(...result.rows);
     }
 
     graded.sort((a, b) => new Date(b.gradedAt) - new Date(a.gradedAt));
@@ -192,7 +269,7 @@ function announcementsUrl(codes, startDate, endDate) {
 async function getAnnouncements({ days = config.announcementLookbackDays } = {}) {
   if (!await exists(config.authFile)) throw new AuthenticationRequiredError('No existe una sesión guardada');
 
-  const api = await request.newContext({ storageState: config.authFile });
+  const api = await request.newContext({ storageState: config.authFile, timeout: config.canvasRequestTimeoutMs });
   try {
     const courses = await listActiveCourses(api);
     const courseNames = new Map(courses.map((course) => [`course_${course.id}`, course.name || `Curso ${course.id}`]));
@@ -206,14 +283,14 @@ async function getAnnouncements({ days = config.announcementLookbackDays } = {})
     for (let index = 0; index < codes.length; index += 10) {
       const group = codes.slice(index, index + 10);
       try {
-        items.push(...await fetchAll(api, announcementsUrl(group, startDate, now)));
+        items.push(...await fetchAll(api, announcementsUrl(group, startDate, now), { courseScoped: true }));
       } catch (error) {
         if (!isCourseRestriction(error)) throw error;
         // Canvas rechaza el lote entero si un solo curso no deja ver anuncios;
         // se reintenta curso por curso para aislar al que falla.
         for (const code of group) {
           try {
-            items.push(...await fetchAll(api, announcementsUrl([code], startDate, now)));
+            items.push(...await fetchAll(api, announcementsUrl([code], startDate, now), { courseScoped: true }));
           } catch (courseError) {
             if (!isCourseRestriction(courseError)) throw courseError;
             skipped.push(courseNames.get(code));
@@ -248,8 +325,13 @@ async function getAnnouncements({ days = config.announcementLookbackDays } = {})
 
 module.exports = {
   AuthenticationRequiredError,
+  CanvasHttpError,
+  canvasGet,
+  fetchAll,
   getAnnouncements,
   getGradedSubmissions,
   getPendingTasks,
+  mapWithConcurrency,
+  readJsonResponse,
   taskStatus,
 };

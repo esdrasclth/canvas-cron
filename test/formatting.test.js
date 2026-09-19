@@ -82,6 +82,23 @@ test('parte los mensajes largos por lineas completas', () => {
   assert.equal(chunks.join('\n'), text);
 });
 
+test('no pierde contenido cuando una sola linea supera el limite', () => {
+  const text = '😀'.repeat(600) + 'x'.repeat(1200);
+  const chunks = splitMessage(text, 300);
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => chunk.length <= 300));
+  assert.equal(chunks.join(''), text);
+});
+
+test('cierra y reabre etiquetas HTML al partir una linea larga', () => {
+  const body = `inicio ${'palabra &amp; '.repeat(80)}fin`;
+  const chunks = splitMessage(`<b>${body}</b>`, 180);
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => chunk.length <= 180));
+  assert.ok(chunks.every((chunk) => chunk.startsWith('<b>') && chunk.endsWith('</b>')));
+  assert.equal(chunks.map((chunk) => chunk.replace(/^<b>|<\/b>$/g, '')).join(''), body);
+});
+
 test('reconoce los comandos, incluso con el nombre del bot', () => {
   assert.equal(parseCommand('/tareas'), 'tareas');
   assert.equal(parseCommand('/Estado@canvas_ceutec_bot'), 'estado');

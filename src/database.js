@@ -4,6 +4,12 @@ const config = require('./config');
 function openDatabase() {
   const db = new Database(config.databaseFile);
   db.pragma('journal_mode = WAL');
+  db.pragma(`busy_timeout = ${config.sqliteBusyTimeoutMs}`);
+  const schemaVersion = db.pragma('user_version', { simple: true });
+  if (schemaVersion > 2) {
+    db.close();
+    throw new Error(`La base usa el esquema ${schemaVersion}, pero esta version solo entiende hasta el 2.`);
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       task_key TEXT PRIMARY KEY,
@@ -68,11 +74,28 @@ function openDatabase() {
       snooze_until TEXT,
       updated_at TEXT NOT NULL
     );
+
+    -- Cola persistente de avisos. Separar la deteccion de la entrega evita que
+    -- una sincronizacion posterior haga desaparecer un aviso retenido.
+    CREATE TABLE IF NOT EXISTS alert_outbox (
+      notification_key TEXT PRIMARY KEY,
+      task_key TEXT,
+      kind TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      next_chunk INTEGER NOT NULL DEFAULT 0
+    );
   `);
 
   // Las bases creadas antes de guardar el tipo de actividad se migran aqui.
   const columns = db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name);
   if (!columns.includes('type')) db.exec('ALTER TABLE tasks ADD COLUMN type TEXT');
+  const outboxColumns = db.prepare('PRAGMA table_info(alert_outbox)').all().map((column) => column.name);
+  if (!outboxColumns.includes('next_chunk')) {
+    db.exec('ALTER TABLE alert_outbox ADD COLUMN next_chunk INTEGER NOT NULL DEFAULT 0');
+  }
+  if (schemaVersion < 2) db.pragma('user_version = 2');
 
   const statements = {
     getTask: db.prepare('SELECT * FROM tasks WHERE task_key = ?'),
@@ -166,6 +189,26 @@ function openDatabase() {
     `),
     clearAction: db.prepare('DELETE FROM task_actions WHERE task_key = ?'),
     listSnoozed: db.prepare('SELECT * FROM task_actions WHERE snooze_until IS NOT NULL'),
+    enqueueAlert: db.prepare(`
+      INSERT INTO alert_outbox (
+        notification_key, task_key, kind, payload, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(notification_key) DO UPDATE SET
+        task_key = excluded.task_key,
+        kind = excluded.kind,
+        payload = CASE
+          WHEN alert_outbox.next_chunk = 0 THEN excluded.payload
+          ELSE alert_outbox.payload
+        END,
+        updated_at = excluded.updated_at
+    `),
+    listQueuedAlerts: db.prepare(`
+      SELECT payload, next_chunk FROM alert_outbox ORDER BY created_at, notification_key
+    `),
+    removeQueuedAlert: db.prepare('DELETE FROM alert_outbox WHERE notification_key = ?'),
+    updateQueuedProgress: db.prepare(`
+      UPDATE alert_outbox SET next_chunk = ?, updated_at = ? WHERE notification_key = ?
+    `),
   };
 
   function rowToTask(row) {
@@ -236,6 +279,36 @@ function openDatabase() {
     clearSnooze: (key, now) => statements.clearSnooze.run(now, key),
     clearTaskAction: (key) => statements.clearAction.run(key),
     listSnoozedTasks: () => statements.listSnoozed.all(),
+
+    enqueueAlerts(alerts, now) {
+      const enqueue = db.transaction(() => {
+        for (const alert of alerts) {
+          statements.enqueueAlert.run(
+            alert.key,
+            alert.taskKey ?? null,
+            alert.kind,
+            JSON.stringify(alert),
+            now,
+            now,
+          );
+        }
+      });
+      enqueue();
+    },
+    listQueuedAlerts: () => statements.listQueuedAlerts.all().map((row) => ({
+      ...JSON.parse(row.payload),
+      outboxNextChunk: row.next_chunk,
+    })),
+    updateQueuedAlertProgress: (key, nextChunk, now) => statements.updateQueuedProgress.run(nextChunk, now, key),
+    removeQueuedAlert: (key) => statements.removeQueuedAlert.run(key),
+    markAlertDelivered(alert, sentAt) {
+      const commit = db.transaction(() => {
+        statements.addNotification.run(alert.key, alert.taskKey ?? null, alert.kind, sentAt);
+        statements.removeQueuedAlert.run(alert.key);
+        if (alert.clearSnooze) statements.clearSnooze.run(sentAt, alert.taskKey);
+      });
+      commit();
+    },
 
     close: () => db.close(),
   };
