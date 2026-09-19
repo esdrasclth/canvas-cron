@@ -427,6 +427,78 @@ function buildAnnouncementsList(rows, now = new Date()) {
   return lines.filter((line) => line !== null).join('\n').trimEnd();
 }
 
+function recentGradeLine(row, now = new Date()) {
+  return `• <b>${escapeHtml(row.title)}</b> — ${escapeHtml(formatScore(row))}\n   <i>${escapeHtml(row.course)} · ${escapeHtml(relativeTime(row.graded_at, now))}</i>`;
+}
+
+function recentAnnouncementLine(row, now = new Date()) {
+  const when = row.posted_at ? ` · ${escapeHtml(relativeTime(row.posted_at, now))}` : '';
+  return `• <a href="${escapeHtml(row.url)}"><b>${escapeHtml(row.title)}</b></a>\n   <i>${escapeHtml(row.course)}${when}</i>`;
+}
+
+// Bloque de /revisar: dice si hubo novedades y, haya o no, muestra lo último
+// registrado para que una revisión sin cambios no parezca vacía o rota.
+function buildRecentSection({
+  heading, fresh = 0, held = 0, error = null, skipped = [], rows = [], formatRow, now = new Date(), labels,
+}) {
+  const lines = [heading];
+
+  if (error) {
+    lines.push(`⚠️ No pude consultarlas en Canvas: <i>${escapeHtml(String(error).slice(0, 200))}</i>`);
+  } else if (held) {
+    lines.push(`${fresh} ${fresh === 1 ? labels.one : labels.many}; te ${fresh === 1 ? 'llegará' : 'llegarán'} al terminar las horas de silencio.`);
+  } else if (fresh) {
+    lines.push(`${fresh} ${fresh === 1 ? labels.one : labels.many}: ${fresh === 1 ? labels.sentOne : labels.sentMany} arriba.`);
+  } else {
+    lines.push(labels.none);
+  }
+
+  if (skipped.length) lines.push(`<i>Sin acceso en: ${escapeHtml(skipped.join(', '))}</i>`);
+
+  if (rows.length) {
+    lines.push('', `<i>${labels.recent}</i>`);
+    for (const row of rows) lines.push(formatRow(row, now));
+  } else if (!error) {
+    lines.push(`<i>${labels.empty}</i>`);
+  }
+
+  return lines.join('\n');
+}
+
+function buildGradesSection(options) {
+  return buildRecentSection({
+    heading: '🎓 <b>Calificaciones</b>',
+    formatRow: recentGradeLine,
+    labels: {
+      one: 'calificación nueva',
+      many: 'calificaciones nuevas',
+      sentOne: 'te la envié',
+      sentMany: 'te las envié',
+      none: 'No hay calificaciones nuevas.',
+      recent: options.rows?.length === 1 ? 'Última registrada:' : 'Últimas registradas:',
+      empty: 'Todavía no hay calificaciones registradas.',
+    },
+    ...options,
+  });
+}
+
+function buildAnnouncementsSection(options) {
+  return buildRecentSection({
+    heading: '📢 <b>Anuncios</b>',
+    formatRow: recentAnnouncementLine,
+    labels: {
+      one: 'anuncio nuevo',
+      many: 'anuncios nuevos',
+      sentOne: 'te lo envié',
+      sentMany: 'te los envié',
+      none: 'No hay anuncios nuevos.',
+      recent: options.rows?.length === 1 ? 'Último registrado:' : 'Últimos registrados:',
+      empty: 'Todavía no hay anuncios registrados.',
+    },
+    ...options,
+  });
+}
+
 const SECTIONS = [
   { bucket: 'overdue', title: '🚨 VENCIDAS', showDay: true },
   { bucket: 'today', title: '🔴 HOY', showDay: false },
@@ -529,6 +601,8 @@ function shouldSendWeekly(database, now = new Date()) {
 module.exports = {
   buildAnnouncementAlerts,
   buildAnnouncementsList,
+  buildAnnouncementsSection,
+  buildGradesSection,
   buildDigest,
   buildGradeAlerts,
   buildGradesList,

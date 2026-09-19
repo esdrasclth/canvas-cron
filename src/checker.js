@@ -82,20 +82,37 @@ async function loadGrades(database, now) {
 
   try {
     const result = await getGradedSubmissions();
-    return { items: result.submissions, alerts: buildGradeAlerts(result.submissions, database, now) };
+    return {
+      items: result.submissions,
+      skipped: result.skipped,
+      alerts: buildGradeAlerts(result.submissions, database, now),
+    };
   } catch (error) {
     console.error(`No se pudieron leer las calificaciones: ${error.message}`);
     return { items: [], alerts: [], error: error.message };
   }
 }
 
+// La primera carga trae el historial del periodo para que /anuncios tenga algo
+// que mostrar aunque en los ultimos dias no se haya publicado nada. Esa pasada
+// no avisa: todo lo que trae ya estaba publicado.
+const ANNOUNCEMENT_HISTORY_DAYS = 180;
+
 async function loadAnnouncements(database, now) {
   if (!config.trackAnnouncements) return { items: [], alerts: [] };
 
+  const backfill = database.getState('announcements_history') !== '1';
   try {
-    const result = await getAnnouncements();
+    const result = await getAnnouncements({
+      days: backfill ? Math.max(ANNOUNCEMENT_HISTORY_DAYS, config.announcementLookbackDays) : config.announcementLookbackDays,
+    });
     const items = result.announcements.map((item) => ({ ...item, text: htmlToText(item.message) }));
-    return { items, alerts: buildAnnouncementAlerts(items, database, now) };
+    return {
+      items,
+      backfill,
+      skipped: result.skipped,
+      alerts: backfill ? [] : buildAnnouncementAlerts(items, database, now),
+    };
   } catch (error) {
     console.error(`No se pudieron leer los anuncios: ${error.message}`);
     return { items: [], alerts: [], error: error.message };
@@ -105,19 +122,30 @@ async function loadAnnouncements(database, now) {
 // Lo que quedó retenido (horas de silencio o simulación) no se guarda: si se
 // guardara, la siguiente revisión ya no lo vería como nuevo y el aviso se
 // perdería.
+// El error y los cursos saltados quedan en system_state para que /revisar y
+// /estado los muestren: antes solo iban al log del contenedor.
 function commitUpdates(database, grades, announcements, pending, now) {
   const iso = now.toISOString();
 
-  if (!grades.error && config.trackGrades) {
-    const heldGrades = pendingKeys(pending, 'graded');
-    database.syncSubmissions(grades.items.filter((item) => !heldGrades.has(item.key)), iso);
-    database.setState('grades_initialized', '1');
+  if (config.trackGrades) {
+    database.setState('grades_error', grades.error || '');
+    if (!grades.error) {
+      const heldGrades = pendingKeys(pending, 'graded');
+      database.syncSubmissions(grades.items.filter((item) => !heldGrades.has(item.key)), iso);
+      database.setState('grades_initialized', '1');
+      database.setState('grades_skipped', (grades.skipped || []).join(', '));
+    }
   }
 
-  if (!announcements.error && config.trackAnnouncements) {
-    const heldAnnouncements = pendingKeys(pending, 'announcement');
-    database.saveAnnouncements(announcements.items.filter((item) => !heldAnnouncements.has(item.key)), iso);
-    database.setState('announcements_initialized', '1');
+  if (config.trackAnnouncements) {
+    database.setState('announcements_error', announcements.error || '');
+    if (!announcements.error) {
+      const heldAnnouncements = pendingKeys(pending, 'announcement');
+      database.saveAnnouncements(announcements.items.filter((item) => !heldAnnouncements.has(item.key)), iso);
+      database.setState('announcements_initialized', '1');
+      database.setState('announcements_history', '1');
+      database.setState('announcements_skipped', (announcements.skipped || []).join(', '));
+    }
   }
 }
 
@@ -208,6 +236,12 @@ async function runCheck() {
       gradeAlerts: grades.alerts.length,
       announcementsTracked: announcements.items.length,
       announcementAlerts: announcements.alerts.length,
+      gradesHeld: pending.filter((alert) => alert.kind === 'graded').length,
+      announcementsHeld: pending.filter((alert) => alert.kind === 'announcement').length,
+      gradesError: grades.error || null,
+      announcementsError: announcements.error || null,
+      gradesSkipped: grades.skipped || [],
+      announcementsSkipped: announcements.skipped || [],
       alertsPrepared: taskAlerts.length + grades.alerts.length + announcements.alerts.length,
       alertsDelivered: delivered,
       alertsHeldForQuietHours: held,

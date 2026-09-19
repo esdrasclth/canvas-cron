@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const config = require('./config');
 const {
-  buildAnnouncementsList, buildDigest, buildGradesList, buildGroupedList, buildWeeklyDigest, dueBucket,
+  buildAnnouncementsList, buildAnnouncementsSection, buildDigest, buildGradesList, buildGradesSection, buildGroupedList, buildWeeklyDigest, dueBucket,
   formatDate, inQuietHours, relativeTime,
 } = require('./notifications');
 const { installAuthState, readAuthState, summarizeAuthState } = require('./storage');
@@ -77,6 +77,12 @@ function listCommand({ header, empty, filter }) {
   };
 }
 
+// Si la ultima lectura fallo, la lista puede estar vacia o vieja: se dice.
+function withSourceError(text, error) {
+  if (!error) return text;
+  return `${text}\n\n⚠️ <i>La última consulta a Canvas falló: ${escapeHtml(error.slice(0, 200))}</i>`;
+}
+
 function knownCourses(database) {
   return [...new Set([
     ...database.listActiveTasks().map((task) => task.course),
@@ -120,6 +126,10 @@ async function statusCommand() {
       `Vencidas ${counts.overdue || 0} · hoy ${counts.today || 0} · mañana ${counts.tomorrow || 0} · esta semana ${counts.week || 0} · después ${counts.later || 0}`,
       `Calificaciones guardadas: ${database.listGradedSubmissions(500).length}`,
       `Anuncios guardados: ${database.listRecentAnnouncements(500).length}`,
+      database.getState('grades_error') ? `⚠️ Calificaciones: ${escapeHtml(database.getState('grades_error').slice(0, 200))}` : null,
+      database.getState('announcements_error') ? `⚠️ Anuncios: ${escapeHtml(database.getState('announcements_error').slice(0, 200))}` : null,
+      database.getState('grades_skipped') ? `Sin acceso a notas en: ${escapeHtml(database.getState('grades_skipped'))}` : null,
+      database.getState('announcements_skipped') ? `Sin acceso a anuncios en: ${escapeHtml(database.getState('announcements_skipped'))}` : null,
       snoozed ? `Aplazadas: ${snoozed}` : null,
       muted.length ? `Cursos silenciados: ${escapeHtml(muted.join(', '))}` : 'Ningún curso silenciado',
       '',
@@ -160,6 +170,9 @@ async function sessionCommand() {
   ].filter(Boolean).join('\n');
 }
 
+// Cuantas notas y anuncios recientes se muestran tras /revisar.
+const RECENT_LIMIT = 5;
+
 async function checkCommand() {
   // Se carga aqui para que un fallo de better-sqlite3 o Playwright no impida
   // que el resto de los comandos respondan.
@@ -167,17 +180,43 @@ async function checkCommand() {
   const summary = await runCheck();
   if (!summary) return '⏳ Ya hay una revisión en curso. Intenta de nuevo en un momento.';
 
-  return [
+  const now = new Date();
+  const recent = withDatabase((database) => ({
+    grades: database.listGradedSubmissions(RECENT_LIMIT),
+    announcements: database.listRecentAnnouncements(RECENT_LIMIT),
+  }));
+
+  const sections = [[
     '✅ <b>Revisión completada</b>',
     '',
     `Pendientes: <b>${summary.pendingTasks}</b>`,
     `Avisos enviados: ${summary.alertsDelivered}`,
     summary.alertsHeldForQuietHours ? `Retenidos por horas de silencio: ${summary.alertsHeldForQuietHours}` : null,
-    summary.gradeAlerts ? `Calificaciones nuevas: ${summary.gradeAlerts}` : null,
-    summary.announcementAlerts ? `Anuncios nuevos: ${summary.announcementAlerts}` : null,
-    '',
-    '<i>Usa /tareas, /notas o /anuncios para ver el detalle.</i>',
-  ].filter(Boolean).join('\n');
+  ].filter((line) => line !== null).join('\n')];
+
+  if (config.trackGrades) {
+    sections.push(buildGradesSection({
+      fresh: summary.gradeAlerts,
+      held: summary.gradesHeld,
+      error: summary.gradesError,
+      skipped: summary.gradesSkipped,
+      rows: recent.grades,
+      now,
+    }));
+  }
+  if (config.trackAnnouncements) {
+    sections.push(buildAnnouncementsSection({
+      fresh: summary.announcementAlerts,
+      held: summary.announcementsHeld,
+      error: summary.announcementsError,
+      skipped: summary.announcementsSkipped,
+      rows: recent.announcements,
+      now,
+    }));
+  }
+
+  sections.push('<i>Usa /tareas, /notas o /anuncios para ver más.</i>');
+  return sections.join('\n\n');
 }
 
 function muteCommand(args) {
@@ -255,11 +294,17 @@ const HANDLERS = {
   }),
   notas: async () => {
     const now = new Date();
-    return withDatabase((database) => buildGradesList(database.listGradedSubmissions(15), now));
+    return withDatabase((database) => withSourceError(
+      buildGradesList(database.listGradedSubmissions(15), now),
+      database.getState('grades_error'),
+    ));
   },
   anuncios: async () => {
     const now = new Date();
-    return withDatabase((database) => buildAnnouncementsList(database.listRecentAnnouncements(8), now));
+    return withDatabase((database) => withSourceError(
+      buildAnnouncementsList(database.listRecentAnnouncements(8), now),
+      database.getState('announcements_error'),
+    ));
   },
   resumen: async () => {
     const now = new Date();

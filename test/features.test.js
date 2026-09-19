@@ -318,3 +318,48 @@ test('la lista de anuncios muestra título, curso y un extracto', () => {
   assert.match(text, /aula B-204/);
   assert.match(text, /hace 2 h/);
 });
+
+test('sin calificaciones nuevas lo dice y muestra las últimas registradas', () => {
+  const { buildGradesSection } = require('../src/notifications');
+  const rows = [
+    { title: 'Quiz 1', course: 'Programación II', score: 18, points_possible: 20, grade: '18', graded_at: '2026-09-15T18:00:00.000Z' },
+  ];
+  const text = buildGradesSection({ fresh: 0, rows, now });
+  assert.match(text, /No hay calificaciones nuevas\./);
+  assert.match(text, /Última registrada:/);
+  assert.match(text, /Quiz 1<\/b> — 18 \/ 20 \(90%\)/);
+  assert.match(text, /hace 1 día/);
+});
+
+test('con anuncios nuevos lo indica y sigue listando los recientes', () => {
+  const { buildAnnouncementsSection } = require('../src/notifications');
+  const rows = [
+    { title: 'Aula B-204', course: 'Programación II', url: 'https://example.com/a', posted_at: '2026-09-16T16:00:00.000Z' },
+    { title: 'Bienvenida', course: 'Cálculo', url: 'https://example.com/b', posted_at: '2026-09-01T16:00:00.000Z' },
+  ];
+  const text = buildAnnouncementsSection({ fresh: 1, rows, now });
+  assert.match(text, /1 anuncio nuevo: te lo envié arriba\./);
+  assert.match(text, /Últimos registrados:/);
+  assert.match(text, /Bienvenida/);
+
+  const held = buildAnnouncementsSection({ fresh: 2, held: 2, rows, now });
+  assert.match(held, /2 anuncios nuevos; te llegarán al terminar las horas de silencio\./);
+});
+
+test('sin nada registrado ni novedades lo explica en vez de quedar vacío', () => {
+  const { buildAnnouncementsSection } = require('../src/notifications');
+  const text = buildAnnouncementsSection({ fresh: 0, rows: [], now });
+  assert.match(text, /No hay anuncios nuevos\./);
+  assert.match(text, /Todavía no hay anuncios registrados\./);
+});
+
+test('si Canvas falló lo muestra junto con los cursos sin acceso', () => {
+  const { buildGradesSection } = require('../src/notifications');
+  const text = buildGradesSection({ error: 'Canvas respondió HTTP 500', rows: [], now });
+  assert.match(text, /No pude consultarlas en Canvas/);
+  assert.match(text, /HTTP 500/);
+  assert.doesNotMatch(text, /No hay calificaciones nuevas/);
+
+  const skipped = buildGradesSection({ skipped: ['Inglés IV'], rows: [], now });
+  assert.match(skipped, /Sin acceso en: Inglés IV/);
+});

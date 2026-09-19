@@ -147,7 +147,7 @@ pueden consultar las tareas en cualquier momento sin esperar la revisión de los
 | `/sesion` | Cuánto le queda a la sesión y cómo renovarla. |
 | `/silenciar` `<curso>` | Deja de avisar de ese curso. Sin texto lista los cursos. |
 | `/activar` `<curso>` | Vuelve a avisar de un curso silenciado. |
-| `/revisar` | Consulta Canvas en vivo y luego responde. |
+| `/revisar` | Consulta Canvas en vivo; dice si hubo notas o anuncios nuevos y muestra los últimos 5 de cada uno. |
 | `/estado` | Sesión, última revisión, conteos y configuración. |
 | `/ayuda` | La lista de comandos. |
 
@@ -198,7 +198,13 @@ etiqueta que no admite. Si el texto no cabe en un mensaje se recorta y el enlace
 pasa a «Leer completo en Canvas». Los adjuntos se listan por nombre.
 
 La primera revisión solo registra los anuncios existentes, sin avisar, igual que
-con las calificaciones.
+con las calificaciones. Esa primera carga revisa los últimos 180 días para que
+`/anuncios` tenga historial aunque en las últimas dos semanas no se haya
+publicado nada; después se vuelve a `ANNOUNCEMENT_LOOKBACK_DAYS`.
+
+Si un curso no deja ver sus tareas o anuncios (Canvas responde 401, 403 o 404
+solo para ese curso), se salta ese curso y se sigue con los demás. Los cursos
+saltados y el último error de cada consulta aparecen en `/revisar` y `/estado`.
 
 ## Horas de silencio y latido
 

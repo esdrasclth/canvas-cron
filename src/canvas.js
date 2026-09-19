@@ -3,11 +3,19 @@ const config = require('./config');
 const { exists } = require('./storage');
 
 class AuthenticationRequiredError extends Error {
-  constructor(message = 'La sesión de Canvas necesita renovarse') {
+  constructor(message = 'La sesión de Canvas necesita renovarse', status = null) {
     super(message);
     this.name = 'AuthenticationRequiredError';
     this.code = 'AUTH_REQUIRED';
+    this.status = status;
   }
+}
+
+// Con la sesion ya validada (la lista de cursos respondio), un 401/403/404 en
+// un curso concreto significa que ese curso restringe la seccion, no que la
+// sesion caduco: se salta ese curso en vez de perder todos los demas.
+function isCourseRestriction(error) {
+  return [401, 403, 404].includes(error?.status);
 }
 
 async function fetchAll(api, firstUrl) {
@@ -18,10 +26,10 @@ async function fetchAll(api, firstUrl) {
     const response = await api.get(nextUrl);
     const contentType = response.headers()['content-type'] || '';
     if ([401, 403].includes(response.status()) || !contentType.includes('application/json')) {
-      throw new AuthenticationRequiredError();
+      throw new AuthenticationRequiredError(undefined, response.status());
     }
     if (!response.ok()) {
-      throw new Error(`Canvas respondió HTTP ${response.status()}`);
+      throw Object.assign(new Error(`Canvas respondió HTTP ${response.status()}`), { status: response.status() });
     }
     items.push(...await response.json());
     nextUrl = response.headers().link?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
@@ -128,13 +136,21 @@ async function getGradedSubmissions() {
   try {
     const courses = await listActiveCourses(api);
     const graded = [];
+    const skipped = [];
 
     for (const course of courses) {
       const url = new URL(`/api/v1/courses/${course.id}/assignments`, config.canvasOrigin);
       url.searchParams.append('include[]', 'submission');
       url.searchParams.set('per_page', '100');
 
-      const assignments = await fetchAll(api, url.toString());
+      let assignments;
+      try {
+        assignments = await fetchAll(api, url.toString());
+      } catch (error) {
+        if (!isCourseRestriction(error)) throw error;
+        skipped.push(course.name || `Curso ${course.id}`);
+        continue;
+      }
       for (const assignment of assignments) {
         const submission = assignment.submission;
         if (!submission || !submission.graded_at) continue;
@@ -156,7 +172,7 @@ async function getGradedSubmissions() {
     }
 
     graded.sort((a, b) => new Date(b.gradedAt) - new Date(a.gradedAt));
-    return { courses: courses.length, submissions: graded };
+    return { courses: courses.length, submissions: graded, skipped };
   } finally {
     await api.dispose();
   }
@@ -164,6 +180,15 @@ async function getGradedSubmissions() {
 
 // Los anuncios de todos los cursos salen de un solo endpoint filtrado por
 // context_codes; se parten en grupos para no armar URLs enormes.
+function announcementsUrl(codes, startDate, endDate) {
+  const url = new URL('/api/v1/announcements', config.canvasOrigin);
+  for (const code of codes) url.searchParams.append('context_codes[]', code);
+  url.searchParams.set('start_date', startDate.toISOString());
+  url.searchParams.set('end_date', endDate.toISOString());
+  url.searchParams.set('per_page', '50');
+  return url.toString();
+}
+
 async function getAnnouncements({ days = config.announcementLookbackDays } = {}) {
   if (!await exists(config.authFile)) throw new AuthenticationRequiredError('No existe una sesión guardada');
 
@@ -174,35 +199,48 @@ async function getAnnouncements({ days = config.announcementLookbackDays } = {})
     const now = new Date();
     const startDate = new Date(now.getTime() - days * 86_400_000);
     const announcements = [];
+    const skipped = [];
+    const items = [];
 
     const codes = [...courseNames.keys()];
     for (let index = 0; index < codes.length; index += 10) {
-      const url = new URL('/api/v1/announcements', config.canvasOrigin);
-      for (const code of codes.slice(index, index + 10)) url.searchParams.append('context_codes[]', code);
-      url.searchParams.set('start_date', startDate.toISOString());
-      url.searchParams.set('end_date', now.toISOString());
-      url.searchParams.set('per_page', '50');
-
-      for (const item of await fetchAll(api, url.toString())) {
-        const courseId = String(item.context_code || '').replace(/^course_/, '');
-        announcements.push({
-          key: `${courseId}:${item.id}`,
-          title: item.title || '(Sin título)',
-          course: courseNames.get(item.context_code) || `Curso ${courseId}`,
-          author: item.author?.display_name || item.user_name || null,
-          message: item.message || '',
-          attachments: (item.attachments || []).map((file) => file.display_name || file.filename).filter(Boolean),
-          postedAt: item.posted_at || item.delayed_post_at || item.created_at,
-          url: item.html_url
-            ? new URL(item.html_url, config.canvasOrigin).toString()
-            : `${config.canvasOrigin}/courses/${courseId}/discussion_topics/${item.id}`,
-        });
+      const group = codes.slice(index, index + 10);
+      try {
+        items.push(...await fetchAll(api, announcementsUrl(group, startDate, now)));
+      } catch (error) {
+        if (!isCourseRestriction(error)) throw error;
+        // Canvas rechaza el lote entero si un solo curso no deja ver anuncios;
+        // se reintenta curso por curso para aislar al que falla.
+        for (const code of group) {
+          try {
+            items.push(...await fetchAll(api, announcementsUrl([code], startDate, now)));
+          } catch (courseError) {
+            if (!isCourseRestriction(courseError)) throw courseError;
+            skipped.push(courseNames.get(code));
+          }
+        }
       }
+    }
+
+    for (const item of items) {
+      const courseId = String(item.context_code || '').replace(/^course_/, '');
+      announcements.push({
+        key: `${courseId}:${item.id}`,
+        title: item.title || '(Sin título)',
+        course: courseNames.get(item.context_code) || `Curso ${courseId}`,
+        author: item.author?.display_name || item.user_name || null,
+        message: item.message || '',
+        attachments: (item.attachments || []).map((file) => file.display_name || file.filename).filter(Boolean),
+        postedAt: item.posted_at || item.delayed_post_at || item.created_at,
+        url: item.html_url
+          ? new URL(item.html_url, config.canvasOrigin).toString()
+          : `${config.canvasOrigin}/courses/${courseId}/discussion_topics/${item.id}`,
+      });
     }
 
     // Del mas viejo al mas nuevo, para que lleguen a Telegram en orden.
     announcements.sort((a, b) => new Date(a.postedAt) - new Date(b.postedAt));
-    return { courses: courses.length, announcements };
+    return { courses: courses.length, announcements, skipped };
   } finally {
     await api.dispose();
   }
