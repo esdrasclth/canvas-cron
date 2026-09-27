@@ -1,258 +1,307 @@
-# Monitor de tareas de UNITEC y Canvas
+<div align="center">
 
-Servicio de Node.js que consulta Canvas con una sesión guardada, identifica tareas
-pendientes y envía alertas por Telegram. Está preparado para ejecutarse en un
-contenedor administrado por Dokploy sin abrir un navegador durante las revisiones
-normales.
+# Canvas Cron
 
-Chromium solo se inicia en modo headless cuando la sesión necesita renovarse.
+### Las tareas de Canvas te llegan por Telegram antes de que venzan
 
-## Comandos locales
+[![Licencia MIT](https://img.shields.io/badge/licencia-MIT-e2632d)](LICENSE)
+[![Node 20](https://img.shields.io/badge/node-20+-e2632d)](https://nodejs.org/)
+[![Playwright](https://img.shields.io/badge/Playwright-1.63-2EAD33)](https://playwright.dev/)
+[![Telegram](https://img.shields.io/badge/Telegram-bot-26A5E4)](https://core.telegram.org/bots)
 
-```powershell
-npm install
-npm run portal
-npm run tasks
-npm run check
-npm test
-```
+Un servicio que revisa Canvas cada 30 minutos con tu sesión y te escribe por
+Telegram cuando aparece una tarea, cambia una fecha, se acerca un vencimiento,
+publican una nota o un docente deja un anuncio. Corre en un contenedor sin abrir
+un navegador, salvo cuando la sesión necesita renovarse.
 
-- `npm run portal`: abre el portal para iniciar sesión manualmente.
-- `npm run tasks`: genera la lista local anterior de tareas.
-- `npm run check`: ejecuta el monitor y las reglas de notificación.
-- `npm run service`: inicia el endpoint interno `/health` para mantener activo el contenedor.
-- `npm run auth:export`: exporta la sesión en Base64 para cargarla inicialmente en Dokploy.
-- `npm run telegram:setup`: valida el token del bot y encuentra el `chat_id` después de enviarle `/start`.
+<img src="docs/capturas/resumen.png" alt="Resumen diario en Telegram" width="360">
 
-`npm run check` usa Telegram en modo de prueba mientras falten el token o el chat ID.
-Los mensajes aparecen en la terminal y no se envían.
+</div>
 
-## Datos persistentes
+## Por qué
 
-En desarrollo se usa `./data`. En Docker se monta `/app/data`, que contiene:
+Canvas avisa por correo, mezclado con todo lo demás, y su calendario no dice qué
+urge más. Lo que se pierde no es la tarea lejana: es el quiz que cierra esta
+noche y que nadie recordó abrir.
+
+Canvas Cron ordena las entregas por urgencia —vencidas, hoy, mañana, esta semana,
+más adelante— y las manda al único lugar que se mira siempre: el chat. Cada aviso
+trae dos botones para decir «ya la entregué» o «recuérdamelo en 2 horas», así que
+deja de insistir cuando ya no hace falta.
+
+## Qué hace
+
+| | |
+| --- | --- |
+| **Actividades** | Aviso cuando aparece una tarea, quiz o foro nuevo, y cuando le cambian la fecha |
+| **Recordatorios** | A las 72, 24, 6, 3 y 1 hora de vencer; los de 6 h o menos van en rojo |
+| **Vencidas** | Aviso si una actividad pasa de fecha sin entregarse, y si ya cerró |
+| **Calificaciones** | Aviso de cada nota nueva o cambiada, con el porcentaje |
+| **Anuncios** | El anuncio completo del docente, pasado de HTML a texto, con sus adjuntos |
+| **Resumen diario** | A las 18:00, todo lo pendiente agrupado por urgencia |
+| **Repaso semanal** | Los domingos, los próximos 7 días y los puntos en juego |
+| **Botones** | «Ya la entregué» y «Recordar en 2 h» en cada aviso |
+| **Comandos** | `/tareas`, `/hoy`, `/notas`, `/revisar` y otros diez, respondidos al instante |
+| **Horas de silencio** | De 23:00 a 6:00 sólo pasa lo urgente; lo demás espera a la mañana |
+| **Latido** | Si las revisiones dejan de ocurrir, el bot lo dice |
+| **Sesión** | Se renueva sola con Chromium headless, o enviándole el archivo por Telegram |
+
+## Cómo se ve
+
+### Avisos
+
+<table>
+<tr>
+<td width="33%"><img src="docs/capturas/avisos.png" alt="Avisos con botones"></td>
+<td width="33%"><img src="docs/capturas/notas.png" alt="Calificaciones"></td>
+<td width="33%"><img src="docs/capturas/anuncio.png" alt="Anuncio"></td>
+</tr>
+<tr>
+<td><b>Actividades</b> — nueva, por vencer y aplazada</td>
+<td><b>Calificaciones</b> — el aviso y <code>/notas</code></td>
+<td><b>Anuncios</b> — completos y con adjuntos</td>
+</tr>
+</table>
+
+### Consultas
+
+<table>
+<tr>
+<td width="33%"><img src="docs/capturas/resumen.png" alt="Resumen diario"></td>
+<td width="33%"><img src="docs/capturas/semana.png" alt="Repaso semanal"></td>
+<td width="33%"><img src="docs/capturas/comandos.png" alt="Comandos"></td>
+</tr>
+<tr>
+<td><b>Resumen diario</b> — agrupado por urgencia</td>
+<td><b>Repaso semanal</b> — con los puntos en juego</td>
+<td><b>Comandos</b> — la ayuda del bot</td>
+</tr>
+</table>
+
+> Los mensajes de las capturas los generan los formateadores reales del bot
+> (`src/notifications.js`) a partir de **cursos y tareas inventados**, dentro de
+> una maqueta de chat de Telegram.
+
+## Cómo funciona
 
 ```text
-auth/unitec.json       Sesión de Canvas
-chrome-profile/        Perfil utilizado para renovar la sesión
-notifications.db       Tareas y alertas ya enviadas
-output/                Último resultado de la extracción
+cron (cada 30 min) ── npm run check ──> Canvas API ──> SQLite ──> Telegram
+                                           ▲                        │
+            sesión guardada (storageState) ┘                        │
+                                                                    ▼
+health-server.js ── /health · long polling de comandos · latido ── tú
 ```
 
-La carpeta está excluida de Git. Su contenido debe tratarse como una credencial.
+- **La revisión no abre navegador.** Usa la API REST de Canvas con las cookies
+  de una sesión guardada. Chromium sólo arranca, headless, para renovarla.
+- **Cada aviso se registra después de que Telegram lo acepta.** Si la tarea
+  programada se repite o se cae a la mitad, el mismo aviso no sale dos veces;
+  los pendientes esperan en una bandeja de salida.
+- **La primera pasada no avisa.** Registra lo que ya existía, para no mandar un
+  semestre entero de notas viejas el primer día.
+- **Un curso sin acceso no detiene a los demás.** Si Canvas responde 401, 403 o
+  404 para un curso, se salta y se informa en `/revisar` y `/estado`.
+- **Revisiones sin solaparse.** `/revisar` y la tarea programada comparten un
+  archivo de bloqueo con latido.
+
+## Tecnologías
+
+| Área | Tecnología |
+| --- | --- |
+| Servicio | Node.js, sin framework |
+| Navegador | Playwright (Chromium headless), sólo para renovar la sesión |
+| Datos | SQLite con better-sqlite3 |
+| Mensajería | API de bots de Telegram, HTML y long polling |
+| Pruebas | `node:test`, 66 pruebas |
+| Despliegue | Docker Compose en Dokploy, con tarea programada |
+
+## Puesta en marcha
+
+Requisitos: **Node 20+** y un bot de Telegram creado con
+[@BotFather](https://t.me/BotFather).
+
+```bash
+git clone https://github.com/esdrasclth/canvas-cron.git
+cd canvas-cron
+npm install
+npx playwright install chromium
+cp .env.example .env
+```
+
+```bash
+npm run portal           # abre el portal: inicia sesión a mano una vez
+npm run telegram:setup   # valida el token y encuentra tu chat_id tras enviar /start
+npm run check            # una revisión completa
+npm run service          # /health, comandos de Telegram y latido
+```
+
+Mientras falten `TELEGRAM_BOT_TOKEN` o `TELEGRAM_CHAT_ID`, `npm run check`
+trabaja en modo de prueba: los mensajes se imprimen en la terminal y no se
+envían.
+
+> **Hecho para UNITEC.** El portal y la instancia de Canvas
+> (`unitechonduras.instructure.com`) están en `src/config.js`,
+> `src/session.js` y `scripts/portal.js`. Para otra universidad hay que cambiar
+> esas URLs y, si el inicio de sesión no es con Microsoft, el flujo de
+> `src/session.js`. Todo lo que habla con la API de Canvas es genérico.
+
+## Scripts
+
+| Script | Qué hace |
+| --- | --- |
+| `npm run portal` | Abre el portal para iniciar sesión a mano y guarda la sesión |
+| `npm run tasks` | Extrae las tareas pendientes a `artifacts/pending-tasks.md` y `.json` |
+| `npm run check` | Una revisión: consulta Canvas, aplica las reglas y envía los avisos |
+| `npm run service` | Servidor de salud, comandos de Telegram y latido |
+| `npm run auth:export` | Exporta la sesión en base64 para cargarla en el servidor |
+| `npm run telegram:setup` | Valida el token del bot y encuentra el `chat_id` |
+| `npm test` | Pruebas |
 
 ## Variables
 
-Copia `.env.example` como `.env` para desarrollo. En Dokploy configura las
-variables desde la sección Environment del servicio.
+`.env.example` las lista todas con su valor por defecto. Las que hay que llenar:
 
 | Variable | Uso |
 | --- | --- |
-| `TELEGRAM_BOT_TOKEN` | Token entregado por BotFather. |
-| `TELEGRAM_CHAT_ID` | Chat privado que recibirá las alertas. |
-| `TELEGRAM_DRY_RUN` | `false` habilita el envío real. |
-| `UNITEC_EMAIL` | Correo usado para renovar una sesión vencida. |
-| `UNITEC_PASSWORD` | Contraseña usada únicamente durante la renovación headless. |
-| `AUTH_STATE_B64` | Sesión inicial exportada; puede eliminarse después del primer arranque. |
-| `REMINDER_HOURS` | Umbrales de recordatorio, por defecto `72,24,6,3,1`. |
-| `DAILY_DIGEST_HOUR` | Hora local del resumen diario, por defecto `18`. |
-| `TELEGRAM_COMMANDS` | `false` desactiva la atención de comandos. |
-| `QUIET_HOURS` | Ventana sin avisos no urgentes, por defecto `23-6`. Vacío la desactiva. |
-| `WEEKLY_DIGEST_DAY` | Día del repaso semanal, `0` = domingo. |
-| `WEEKLY_DIGEST_HOUR` | Hora local del repaso semanal, por defecto `19`. |
-| `HEARTBEAT_MINUTES` | Minutos sin revisión antes de avisar, por defecto `90`. |
-| `SESSION_WARN_DAYS` | Días de antelación del aviso de caducidad, por defecto `5`. |
-| `TRACK_GRADES` | `false` desactiva el seguimiento de calificaciones. |
-| `TRACK_ANNOUNCEMENTS` | `false` desactiva los avisos de anuncios. |
-| `ANNOUNCEMENT_LOOKBACK_DAYS` | Días hacia atrás que se consultan los anuncios, por defecto `14`. |
-| `TELEGRAM_POLL_TIMEOUT` | Segundos de long polling, por defecto `50`. |
-| `TELEGRAM_MAX_RETRIES` | Reintentos ante errores 429/5xx de Telegram, por defecto `3`. |
-| `SQLITE_BUSY_TIMEOUT_MS` | Espera ante una escritura concurrente en SQLite, por defecto `5000`. |
-| `CHECK_LOCK_STALE_MINUTES` | Antigüedad para recuperar un lock sin heartbeat, por defecto `20`. |
-| `CANVAS_REQUEST_TIMEOUT_MS` | Timeout por petición a Canvas, por defecto `30000`. |
-| `CANVAS_MAX_RETRIES` | Reintentos ante errores temporales de Canvas, por defecto `2`. |
-| `CANVAS_MAX_PAGES` | Máximo de páginas antes de abortar una respuesta parcial, por defecto `30`. |
-| `CANVAS_CONCURRENCY` | Máximo de consultas simultáneas a Canvas, por defecto `5`. |
-| `TIMEZONE` | Zona horaria, por defecto `America/Tegucigalpa`. |
+| `TELEGRAM_BOT_TOKEN` | Token de BotFather |
+| `TELEGRAM_CHAT_ID` | El único chat que recibe avisos y al que se le atienden comandos |
+| `TELEGRAM_DRY_RUN` | `false` habilita el envío real |
+| `UNITEC_EMAIL` · `UNITEC_PASSWORD` | Sólo para renovar una sesión vencida en headless |
+| `AUTH_STATE_B64` | Sesión inicial exportada; se borra tras el primer arranque |
 
-## Configurar Telegram de forma segura
+<details>
+<summary>Las demás, con sus valores por defecto</summary>
 
-El token de BotFather es una credencial con control total del bot. Si se comparte
-por accidente, revócalo en BotFather con `/revoke` y genera uno nuevo con `/token`.
-Configura el token nuevo directamente en Dokploy y no lo pegues en el repositorio
-ni en el chat. El `TELEGRAM_CHAT_ID` de este usuario es `679645775`.
+| Variable | Uso |
+| --- | --- |
+| `REMINDER_HOURS` | Umbrales de recordatorio, `72,24,6,3,1` |
+| `DAILY_DIGEST_HOUR` | Hora del resumen diario, `18` |
+| `WEEKLY_DIGEST_DAY` · `WEEKLY_DIGEST_HOUR` | Repaso semanal, `0` (domingo) a las `19` |
+| `QUIET_HOURS` | Ventana sin avisos no urgentes, `23-6`; vacía la desactiva |
+| `HEARTBEAT_MINUTES` | Minutos sin revisión antes de avisar, `90` |
+| `SESSION_WARN_DAYS` | Antelación del aviso de caducidad de la sesión, `5` |
+| `TRACK_GRADES` · `TRACK_ANNOUNCEMENTS` | `false` desactiva notas o anuncios |
+| `ANNOUNCEMENT_LOOKBACK_DAYS` | Días hacia atrás de anuncios, `14` |
+| `TELEGRAM_COMMANDS` | `false` desactiva los comandos |
+| `TELEGRAM_POLL_TIMEOUT` · `TELEGRAM_MAX_RETRIES` | Long polling `50` s y reintentos `3` ante 429/5xx |
+| `CANVAS_REQUEST_TIMEOUT_MS` · `CANVAS_MAX_RETRIES` | `30000` ms y `2` reintentos por petición |
+| `CANVAS_MAX_PAGES` · `CANVAS_CONCURRENCY` | `30` páginas como máximo y `5` consultas a la vez |
+| `SQLITE_BUSY_TIMEOUT_MS` | Espera ante escrituras concurrentes, `5000` |
+| `CHECK_LOCK_STALE_MINUTES` | Antigüedad para recuperar un bloqueo huérfano, `20` |
+| `TIMEZONE` | `America/Tegucigalpa` |
+
+</details>
 
 ## Despliegue en Dokploy
 
-El código vive en `https://github.com/esdrasclth/canvas-cron`. Usa ese repositorio
-como fuente en Dokploy: la subida directa de un ZIP devuelve `500 Internal Server
-Error` y no es una vía fiable.
+1. Crea un servicio **Docker Compose** con proveedor **GitHub**, este
+   repositorio, rama `main` y `docker-compose.yml`. (La subida de un ZIP
+   devuelve `500` y no es fiable.)
+2. Copia las variables de `.env.example` en **Environment**.
+3. En tu computadora, `npm run auth:export` y pega el contenido de
+   `artifacts/unitec-auth.b64` en `AUTH_STATE_B64`.
+4. Despliega. El volumen `unitec-bot-data` conserva la sesión y SQLite.
+5. En **Schedules**, crea un trabajo **Compose**: servicio `unitec-bot`,
+   comando `npm run check`, cron `*/30 * * * *`, zona `America/Tegucigalpa`.
+6. Ejecútalo a mano con `TELEGRAM_DRY_RUN=true` y revisa los logs.
+7. Cambia a `TELEGRAM_DRY_RUN=false`.
+8. Borra `AUTH_STATE_B64` cuando exista `/app/data/auth/unitec.json`.
 
-1. En Dokploy crea un servicio **Docker Compose** y elige el proveedor **GitHub**.
-2. Selecciona el repositorio `esdrasclth/canvas-cron`, rama `main`, y deja
-   `docker-compose.yml` como ruta del Compose.
-3. Copia las variables de `.env.example` en la sección Environment.
-4. Genera la sesión inicial localmente:
+No hace falta publicar un dominio: el servidor de salud escucha en el 3000
+dentro del contenedor y la tarea programada entra con `docker exec`.
 
-   ```powershell
-   npm run auth:export
-   ```
+### Diagnóstico
 
-5. Copia el contenido de `artifacts/unitec-auth.b64` a `AUTH_STATE_B64` en Dokploy.
-6. Despliega el Compose. El volumen `unitec-bot-data` conservará la sesión y SQLite.
-7. En **Schedules**, crea un trabajo de tipo **Compose**:
-   - Servicio: `unitec-bot`
-   - Comando: `npm run check`
-   - Cron: `*/30 * * * *`
-   - Zona horaria: `America/Tegucigalpa`
-8. Ejecuta el trabajo manualmente con `TELEGRAM_DRY_RUN=true` y revisa los logs.
-9. Configura el bot y cambia `TELEGRAM_DRY_RUN=false`.
-10. Elimina `AUTH_STATE_B64` después de confirmar que `/app/data/auth/unitec.json` existe.
+**`Container not found` en el schedule.** No hay contenedor en ejecución,
+casi siempre porque el proceso principal murió y quedó en bucle de reinicio.
+El servidor de salud ya no se cae si falla la sesión: se queda en pie y
+reporta el motivo, para que el `docker exec` siempre tenga destino.
 
-No es necesario publicar un dominio. El servicio de salud escucha en el puerto
-3000 dentro del contenedor y el trabajo programado se ejecuta con `docker exec`.
-
-## Diagnóstico en Dokploy
-
-**El schedule responde `Container not found`.** Significa que no hay contenedor en
-ejecución al que entrar, casi siempre porque el proceso principal murió y
-`restart: unless-stopped` lo dejó en bucle de reinicio. Revisa los logs del
-Compose y comprueba el estado del contenedor. El servidor de salud ya no termina
-el proceso cuando falla la preparación de la sesión: se mantiene en pie y reporta
-el motivo, de modo que el `docker exec` del schedule siempre encuentre destino.
-
-**Comprobar el estado desde dentro del contenedor:**
+**Estado desde dentro del contenedor:**
 
 ```sh
 node -e "require('node:http').get('http://127.0.0.1:3000/health',r=>{r.pipe(process.stdout)})"
 ```
 
-- `{"status":"ready"}` — sesión y SQLite válidos; la última revisión no está atrasada.
-- `{"status":"degraded"}` — la última revisión correcta superó `HEARTBEAT_MINUTES`.
-- `{"status":"invalid_session"}` — el archivo existe, pero no es un `storageState` válido.
-- `{"status":"authentication_required","error":"..."}` — falta la sesión; el campo
-  `error` indica si `AUTH_STATE_B64` es inválido.
+| Respuesta | Significa |
+| --- | --- |
+| `ready` | Sesión y SQLite válidos; la última revisión está al día |
+| `degraded` | La última revisión correcta superó `HEARTBEAT_MINUTES` |
+| `invalid_session` | El archivo existe, pero no es un `storageState` válido |
+| `authentication_required` | Falta la sesión; `error` dice si `AUTH_STATE_B64` es inválido |
 
-**`AUTH_STATE_B64` inválido.** El editor de variables puede partir el base64 en
-varias líneas o recortarlo. Los saltos de línea y espacios ya se limpian
-automáticamente, pero un valor truncado se rechaza con un mensaje explícito.
-Vuelve a generarlo con `npm run auth:export` y pega el contenido completo.
+**`AUTH_STATE_B64` inválido.** El editor de variables puede partir o recortar el
+base64. Los saltos de línea se limpian solos; un valor truncado se rechaza con un
+mensaje explícito. Genéralo de nuevo y pégalo completo.
 
 ## Comandos en Telegram
 
-El servicio que mantiene vivo al contenedor también atiende comandos, así que se
-pueden consultar las tareas en cualquier momento sin esperar la revisión de los
-30 minutos. El menú se registra en Telegram al arrancar.
-
 | Comando | Qué devuelve |
 | --- | --- |
-| `/tareas` | Todas las pendientes, agrupadas por urgencia. |
-| `/hoy` | Solo lo que vence hoy. |
-| `/semana` | Los próximos 7 días. |
-| `/vencidas` | Lo que ya pasó de fecha. |
-| `/notas` | Calificaciones recientes, agrupadas por curso con promedio. |
-| `/anuncios` | Los últimos anuncios de los cursos, con un extracto. |
-| `/resumen` | El resumen diario, en el momento. |
-| `/repaso` | El repaso semanal con los puntos en juego. |
-| `/sesion` | Cuánto le queda a la sesión y cómo renovarla. |
-| `/silenciar` `<curso>` | Deja de avisar de ese curso. Sin texto lista los cursos. |
-| `/activar` `<curso>` | Vuelve a avisar de un curso silenciado. |
-| `/revisar` | Consulta Canvas en vivo; dice si hubo notas o anuncios nuevos y muestra los últimos 5 de cada uno. |
-| `/estado` | Sesión, última revisión, conteos y configuración. |
-| `/ayuda` | La lista de comandos. |
+| `/tareas` · `/hoy` · `/semana` · `/vencidas` | Pendientes, agrupadas por urgencia |
+| `/notas` | Calificaciones recientes por curso, con promedio |
+| `/anuncios` | Los últimos anuncios, con un extracto |
+| `/resumen` · `/repaso` | El resumen diario o el semanal, en el momento |
+| `/revisar` | Consulta Canvas en vivo y dice qué hubo de nuevo |
+| `/sesion` | Cuánto le queda a la sesión y cómo renovarla |
+| `/silenciar <curso>` · `/activar <curso>` | Deja de avisar de un curso, o vuelve a hacerlo |
+| `/estado` | Sesión, última revisión, conteos y configuración |
+| `/ayuda` | La lista de comandos |
 
-Las consultas se responden con lo último guardado en SQLite, por lo que son
-inmediatas e incluyen cuándo se actualizó. `/revisar` es el único que sale a
-Canvas, y comparte el mismo archivo de bloqueo que la tarea programada: si una
-revisión ya está en curso, lo dice en lugar de duplicarla.
+Las consultas responden con lo guardado en SQLite, así que son inmediatas;
+`/revisar` es el único que sale a Canvas. Sólo se atiende el chat de
+`TELEGRAM_CHAT_ID`: los mensajes de cualquier otro se registran y se descartan.
 
-Solo se atiende el chat indicado en `TELEGRAM_CHAT_ID`; los mensajes de cualquier
-otro se registran y se descartan. Los comandos quedan inactivos mientras
-`TELEGRAM_DRY_RUN` sea `true`, porque sin envío real no habría respuesta.
+## Sesión
 
-## Renovar la sesión desde Telegram
+**Renovación automática.** Con `UNITEC_EMAIL` y `UNITEC_PASSWORD`, el monitor
+intenta renovar la sesión con Chromium headless. Si Microsoft pide MFA, CAPTCHA
+o una confirmación, avisa por Telegram y hace falta una sesión nueva: el
+proceso **no intenta evadir esos controles**.
 
-Cuando la sesión caduque no hace falta tocar Dokploy ni redesplegar:
+**Renovación desde Telegram.** Ejecuta `npm run portal`, inicia sesión y envía
+`playwright/.auth/unitec.json` al bot **como documento**. El bot lo prueba
+contra Canvas antes de instalarlo; si Canvas lo rechaza, la sesión activa queda
+intacta.
 
-1. `npm run portal` en tu computadora e inicia sesión.
-2. Envía `playwright/.auth/unitec.json` al bot **como documento**.
+El bot avisa solo cuando la sesión está a menos de `SESSION_WARN_DAYS` de
+caducar.
 
-El bot valida que sea un `storageState` de Playwright con cookies y prueba un
-archivo candidato contra Canvas antes de reemplazar la sesión activa. Solo si la
-prueba funciona guarda la anterior como `unitec.json.previous` e instala la
-nueva; si Canvas la rechaza, la sesión activa queda intacta.
+## Datos
 
-El monitor avisa por su cuenta cuando la primera cookie está a menos de
-`SESSION_WARN_DAYS` de caducar, una sola vez al día.
+En desarrollo se usa `./data`; en Docker, el volumen montado en `/app/data`:
 
-## Botones en cada aviso
+```text
+auth/unitec.json     sesión de Canvas
+chrome-profile/      perfil para renovar la sesión
+notifications.db     tareas, notas, anuncios y avisos enviados
+output/              último resultado de la extracción
+```
 
-Los avisos de una actividad llevan dos botones:
+La carpeta está excluida de Git. **Su contenido es una credencial**: con él
+se entra a tu cuenta de Canvas.
 
-- **✅ Ya la entregué** — la marca como resuelta y deja de insistir, incluso si
-  Canvas todavía la reporta como pendiente (útil cuando entregas en papel o por
-  otro medio).
-- **⏰ Recordar en 2 h** — la silencia y, al vencer el plazo, manda un único
-  recordatorio.
+## Estructura
 
-Ambas decisiones viven en la tabla `task_actions`, así que sobreviven a los
-reinicios del contenedor.
+```text
+src/
+  canvas.js          cliente de la API de Canvas, con reintentos y paginación
+  checker.js         una revisión completa
+  notifications.js   reglas de aviso y formato de cada mensaje
+  bot.js             comandos, botones y latido
+  telegram.js        envío, división de mensajes largos y reintentos
+  database.js        SQLite
+  session.js         renovación headless de la sesión
+scripts/             puntos de entrada de cada npm run
+test/                pruebas con node:test
+docs/capturas/       imágenes de este README
+```
 
-## Anuncios
+## Contribuir
 
-Cada revisión consulta `/api/v1/announcements` de los cursos activos de los
-últimos `ANNOUNCEMENT_LOOKBACK_DAYS` días. Un anuncio que no está en la tabla
-`announcements` se envía con su título, curso, autor y contenido. Canvas los
-entrega en HTML; se convierten a texto plano conservando párrafos, viñetas y el
-destino de los enlaces, porque Telegram rechaza el mensaje entero ante una
-etiqueta que no admite. Si el texto no cabe en un mensaje se recorta y el enlace
-pasa a «Leer completo en Canvas». Los adjuntos se listan por nombre.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) explica cómo probar sin enviar mensajes,
+qué no romper y qué comprobar antes de un pull request.
 
-La primera revisión solo registra los anuncios existentes, sin avisar, igual que
-con las calificaciones. Esa primera carga revisa los últimos 180 días para que
-`/anuncios` tenga historial aunque en las últimas dos semanas no se haya
-publicado nada; después se vuelve a `ANNOUNCEMENT_LOOKBACK_DAYS`.
+## Licencia
 
-Si un curso no deja ver sus tareas o anuncios (Canvas responde 401, 403 o 404
-solo para ese curso), se salta ese curso y se sigue con los demás. Los cursos
-saltados y el último error de cada consulta aparecen en `/revisar` y `/estado`.
-
-## Horas de silencio y latido
-
-Durante `QUIET_HOURS` se retienen los avisos informativos (nueva actividad,
-cambio de fecha, calificaciones, resúmenes) y solo pasan los urgentes:
-vencimientos a 6 h o menos y actividades ya vencidas. Lo retenido no se marca
-como enviado, así que sale en la primera revisión fuera de la ventana. Las
-calificaciones y los anuncios retenidos tampoco se guardan como vistos hasta que
-se entregan.
-
-El latido vigila que las revisiones sigan ocurriendo: si pasan más de
-`HEARTBEAT_MINUTES` sin una revisión correcta, el bot avisa, y avisa de nuevo
-cuando se recupera. Cubre el caso de que el contenedor siga en pie mientras la
-tarea programada dejó de correr. Si el contenedor muere por completo no puede
-avisar; para eso están las notificaciones de Dokploy.
-
-## Alertas
-
-El monitor envía mensajes cuando:
-
-- aparece una actividad nueva;
-- cambia una fecha de entrega;
-- faltan 72, 24, 6, 3 o 1 hora;
-- una actividad vence;
-- publican una calificación o la cambian;
-- un docente publica un anuncio (llega con título, autor y el contenido completo);
-- llega la hora del resumen diario (18:00 local, haya novedades o no);
-- es domingo a las 19:00 y toca el repaso de la semana;
-- vence un aplazamiento pedido con el botón «Recordar en 2 h»;
-- la sesión está por caducar;
-- Microsoft exige intervención para renovar la sesión.
-
-SQLite registra cada alerta después de que Telegram la acepta. Si el trabajo vuelve
-a ejecutarse, el mismo aviso no se repite.
-
-## Sesión vencida
-
-El monitor primero intenta renovar la sesión con Chromium headless y las variables
-`UNITEC_EMAIL` y `UNITEC_PASSWORD`. Si Microsoft solicita MFA, CAPTCHA o una
-confirmación adicional, se envía una alerta técnica y será necesario generar y
-cargar una sesión nueva. El proceso no intenta evadir esos controles.
+**[MIT](LICENSE)**. Úsalo, modifícalo y distribúyelo como quieras.
