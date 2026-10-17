@@ -1,0 +1,30 @@
+services:
+  unitec-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    shm_size: 1gb
+    environment:
+      DATA_DIR: /app/data
+      PORT: 3000
+      HEADLESS: ${HEADLESS:-true}
+      TIMEZONE: ${TIMEZONE:-America/Tegucigalpa}
+      DAILY_DIGEST_HOUR: ${DAILY_DIGEST_HOUR:-7}
+      REMINDER_HOURS: ${REMINDER_HOURS:-72,24,6,1}
+      AUTO_REFRESH_SESSION: ${AUTO_REFRESH_SESSION:-true}
+      SEND_INITIAL_NEW_TASKS: ${SEND_INITIAL_NEW_TASKS:-false}
+      SEND_STARTUP_DIGEST: ${SEND_STARTUP_DIGEST:-true}
+      TELEGRAM_DRY_RUN: ${TELEGRAM_DRY_RUN:-true}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      UNITEC_EMAIL: ${UNITEC_EMAIL:-}
+      UNITEC_PASSWORD: ${UNITEC_PASSWORD:-}
+      AUTH_STATE_B64: ${AUTH_STATE_B64:-}
+    volumes:
+      - unitec-bot-data:/app/data
+
+volumes:
+  unitec-bot-data:
+

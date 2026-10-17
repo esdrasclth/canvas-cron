@@ -1,0 +1,22 @@
+{
+  "name": "playwright",
+  "version": "1.0.0",
+  "description": "Monitor de tareas de Canvas con alertas por Telegram para Dokploy",
+  "main": "index.js",
+  "scripts": {
+    "portal": "node scripts/portal.js",
+    "tasks": "node scripts/extract-tasks.js",
+    "check": "node scripts/check-and-notify.js",
+    "service": "node scripts/health-server.js",
+    "auth:export": "node scripts/export-auth.js",
+    "telegram:setup": "node scripts/telegram-setup.js",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "playwright": "^1.63.0"
+  }
+}
