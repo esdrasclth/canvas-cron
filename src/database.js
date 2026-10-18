@@ -4,6 +4,12 @@ const config = require('./config');
 function openDatabase() {
   const db = new Database(config.databaseFile);
   db.pragma('journal_mode = WAL');
+  db.pragma(`busy_timeout = ${config.sqliteBusyTimeoutMs}`);
+  const schemaVersion = db.pragma('user_version', { simple: true });
+  if (schemaVersion > 2) {
+    db.close();
+    throw new Error(`La base usa el esquema ${schemaVersion}, pero esta version solo entiende hasta el 2.`);
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       task_key TEXT PRIMARY KEY,
@@ -14,6 +20,7 @@ function openDatabase() {
       status TEXT NOT NULL,
       url TEXT NOT NULL,
       points REAL,
+      type TEXT,
       first_seen_at TEXT NOT NULL,
       last_seen_at TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1
@@ -30,16 +37,74 @@ function openDatabase() {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS submissions (
+      task_key TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      course TEXT NOT NULL,
+      url TEXT NOT NULL,
+      score REAL,
+      points_possible REAL,
+      grade TEXT,
+      graded_at TEXT,
+      seen_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS course_mutes (
+      course TEXT PRIMARY KEY,
+      muted_at TEXT NOT NULL
+    );
+
+    -- Anuncios ya vistos; el mensaje se guarda en texto plano para /anuncios.
+    CREATE TABLE IF NOT EXISTS announcements (
+      announcement_key TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      course TEXT NOT NULL,
+      author TEXT,
+      message TEXT NOT NULL,
+      url TEXT NOT NULL,
+      posted_at TEXT,
+      seen_at TEXT NOT NULL
+    );
+
+    -- Lo que el usuario decidió desde los botones de cada aviso.
+    CREATE TABLE IF NOT EXISTS task_actions (
+      task_key TEXT PRIMARY KEY,
+      done_at TEXT,
+      snooze_until TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    -- Cola persistente de avisos. Separar la deteccion de la entrega evita que
+    -- una sincronizacion posterior haga desaparecer un aviso retenido.
+    CREATE TABLE IF NOT EXISTS alert_outbox (
+      notification_key TEXT PRIMARY KEY,
+      task_key TEXT,
+      kind TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      next_chunk INTEGER NOT NULL DEFAULT 0
+    );
   `);
+
+  // Las bases creadas antes de guardar el tipo de actividad se migran aqui.
+  const columns = db.prepare('PRAGMA table_info(tasks)').all().map((column) => column.name);
+  if (!columns.includes('type')) db.exec('ALTER TABLE tasks ADD COLUMN type TEXT');
+  const outboxColumns = db.prepare('PRAGMA table_info(alert_outbox)').all().map((column) => column.name);
+  if (!outboxColumns.includes('next_chunk')) {
+    db.exec('ALTER TABLE alert_outbox ADD COLUMN next_chunk INTEGER NOT NULL DEFAULT 0');
+  }
+  if (schemaVersion < 2) db.pragma('user_version = 2');
 
   const statements = {
     getTask: db.prepare('SELECT * FROM tasks WHERE task_key = ?'),
     upsertTask: db.prepare(`
       INSERT INTO tasks (
-        task_key, title, course, due_at, lock_at, status, url, points,
+        task_key, title, course, due_at, lock_at, status, url, points, type,
         first_seen_at, last_seen_at, active
       ) VALUES (
-        @key, @title, @course, @dueAt, @lockAt, @status, @url, @points,
+        @key, @title, @course, @dueAt, @lockAt, @status, @url, @points, @type,
         @now, @now, 1
       )
       ON CONFLICT(task_key) DO UPDATE SET
@@ -50,10 +115,12 @@ function openDatabase() {
         status = excluded.status,
         url = excluded.url,
         points = excluded.points,
+        type = excluded.type,
         last_seen_at = excluded.last_seen_at,
         active = 1
     `),
     deactivateAll: db.prepare('UPDATE tasks SET active = 0'),
+    listActive: db.prepare('SELECT * FROM tasks WHERE active = 1 ORDER BY due_at'),
     hasNotification: db.prepare('SELECT 1 FROM notifications WHERE notification_key = ?'),
     addNotification: db.prepare(`
       INSERT OR IGNORE INTO notifications (notification_key, task_key, kind, sent_at)
@@ -64,11 +131,106 @@ function openDatabase() {
       INSERT INTO system_state (key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `),
+    getSubmission: db.prepare('SELECT * FROM submissions WHERE task_key = ?'),
+    upsertSubmission: db.prepare(`
+      INSERT INTO submissions (
+        task_key, title, course, url, score, points_possible, grade, graded_at, seen_at
+      ) VALUES (
+        @key, @title, @course, @url, @score, @pointsPossible, @grade, @gradedAt, @now
+      )
+      ON CONFLICT(task_key) DO UPDATE SET
+        title = excluded.title,
+        course = excluded.course,
+        url = excluded.url,
+        score = excluded.score,
+        points_possible = excluded.points_possible,
+        grade = excluded.grade,
+        graded_at = excluded.graded_at,
+        seen_at = excluded.seen_at
+    `),
+    listGraded: db.prepare(`
+      SELECT * FROM submissions WHERE graded_at IS NOT NULL
+      ORDER BY graded_at DESC LIMIT ?
+    `),
+    hasAnnouncement: db.prepare('SELECT 1 FROM announcements WHERE announcement_key = ?'),
+    upsertAnnouncement: db.prepare(`
+      INSERT INTO announcements (
+        announcement_key, title, course, author, message, url, posted_at, seen_at
+      ) VALUES (
+        @key, @title, @course, @author, @text, @url, @postedAt, @now
+      )
+      ON CONFLICT(announcement_key) DO UPDATE SET
+        title = excluded.title,
+        course = excluded.course,
+        author = excluded.author,
+        message = excluded.message,
+        url = excluded.url,
+        posted_at = excluded.posted_at
+    `),
+    listAnnouncements: db.prepare('SELECT * FROM announcements ORDER BY posted_at DESC LIMIT ?'),
+    listMutes: db.prepare('SELECT course FROM course_mutes ORDER BY course'),
+    addMute: db.prepare('INSERT OR REPLACE INTO course_mutes (course, muted_at) VALUES (?, ?)'),
+    removeMute: db.prepare('DELETE FROM course_mutes WHERE course = ?'),
+    getAction: db.prepare('SELECT * FROM task_actions WHERE task_key = ?'),
+    setDone: db.prepare(`
+      INSERT INTO task_actions (task_key, done_at, snooze_until, updated_at)
+      VALUES (?, ?, NULL, ?)
+      ON CONFLICT(task_key) DO UPDATE SET done_at = excluded.done_at,
+        snooze_until = NULL, updated_at = excluded.updated_at
+    `),
+    setSnooze: db.prepare(`
+      INSERT INTO task_actions (task_key, done_at, snooze_until, updated_at)
+      VALUES (?, NULL, ?, ?)
+      ON CONFLICT(task_key) DO UPDATE SET snooze_until = excluded.snooze_until,
+        updated_at = excluded.updated_at
+    `),
+    clearSnooze: db.prepare(`
+      UPDATE task_actions SET snooze_until = NULL, updated_at = ? WHERE task_key = ?
+    `),
+    clearAction: db.prepare('DELETE FROM task_actions WHERE task_key = ?'),
+    listSnoozed: db.prepare('SELECT * FROM task_actions WHERE snooze_until IS NOT NULL'),
+    enqueueAlert: db.prepare(`
+      INSERT INTO alert_outbox (
+        notification_key, task_key, kind, payload, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(notification_key) DO UPDATE SET
+        task_key = excluded.task_key,
+        kind = excluded.kind,
+        payload = CASE
+          WHEN alert_outbox.next_chunk = 0 THEN excluded.payload
+          ELSE alert_outbox.payload
+        END,
+        updated_at = excluded.updated_at
+    `),
+    listQueuedAlerts: db.prepare(`
+      SELECT payload, next_chunk FROM alert_outbox ORDER BY created_at, notification_key
+    `),
+    removeQueuedAlert: db.prepare('DELETE FROM alert_outbox WHERE notification_key = ?'),
+    updateQueuedProgress: db.prepare(`
+      UPDATE alert_outbox SET next_chunk = ?, updated_at = ? WHERE notification_key = ?
+    `),
   };
+
+  function rowToTask(row) {
+    return {
+      key: row.task_key,
+      title: row.title,
+      course: row.course,
+      dueAt: row.due_at,
+      lockAt: row.lock_at,
+      status: row.status,
+      url: row.url,
+      points: row.points,
+      type: row.type,
+    };
+  }
 
   return {
     db,
     getTask: (key) => statements.getTask.get(key),
+    // Devuelve las tareas con la misma forma que entrega Canvas, para que los
+    // formateadores sirvan igual con datos frescos o guardados.
+    listActiveTasks: () => statements.listActive.all().map(rowToTask),
     syncTasks(tasks, now) {
       const sync = db.transaction(() => {
         statements.deactivateAll.run();
@@ -80,9 +242,76 @@ function openDatabase() {
     addNotification: (key, taskKey, kind, sentAt) => statements.addNotification.run(key, taskKey, kind, sentAt),
     getState: (key) => statements.getState.get(key)?.value ?? null,
     setState: (key, value) => statements.setState.run(key, value),
+
+    getSubmission: (key) => statements.getSubmission.get(key),
+    syncSubmissions(submissions, now) {
+      const sync = db.transaction(() => {
+        for (const submission of submissions) {
+          statements.upsertSubmission.run({ ...submission, now });
+        }
+      });
+      sync();
+    },
+    listGradedSubmissions: (limit = 20) => statements.listGraded.all(limit),
+
+    hasAnnouncement: (key) => Boolean(statements.hasAnnouncement.get(key)),
+    // Espera los anuncios ya convertidos a texto plano (campo text).
+    saveAnnouncements(announcements, now) {
+      const save = db.transaction(() => {
+        for (const announcement of announcements) {
+          statements.upsertAnnouncement.run({ ...announcement, now });
+        }
+      });
+      save();
+    },
+    listRecentAnnouncements: (limit = 10) => statements.listAnnouncements.all(limit),
+
+    listMutedCourses: () => statements.listMutes.all().map((row) => row.course),
+    muteCourse: (course, now) => statements.addMute.run(course, now),
+    unmuteCourse: (course) => statements.removeMute.run(course).changes > 0,
+    isCourseMuted(course) {
+      return statements.listMutes.all().some((row) => row.course === course);
+    },
+
+    getTaskAction: (key) => statements.getAction.get(key),
+    markTaskDone: (key, now) => statements.setDone.run(key, now, now),
+    snoozeTask: (key, until, now) => statements.setSnooze.run(key, until, now),
+    clearSnooze: (key, now) => statements.clearSnooze.run(now, key),
+    clearTaskAction: (key) => statements.clearAction.run(key),
+    listSnoozedTasks: () => statements.listSnoozed.all(),
+
+    enqueueAlerts(alerts, now) {
+      const enqueue = db.transaction(() => {
+        for (const alert of alerts) {
+          statements.enqueueAlert.run(
+            alert.key,
+            alert.taskKey ?? null,
+            alert.kind,
+            JSON.stringify(alert),
+            now,
+            now,
+          );
+        }
+      });
+      enqueue();
+    },
+    listQueuedAlerts: () => statements.listQueuedAlerts.all().map((row) => ({
+      ...JSON.parse(row.payload),
+      outboxNextChunk: row.next_chunk,
+    })),
+    updateQueuedAlertProgress: (key, nextChunk, now) => statements.updateQueuedProgress.run(nextChunk, now, key),
+    removeQueuedAlert: (key) => statements.removeQueuedAlert.run(key),
+    markAlertDelivered(alert, sentAt) {
+      const commit = db.transaction(() => {
+        statements.addNotification.run(alert.key, alert.taskKey ?? null, alert.kind, sentAt);
+        statements.removeQueuedAlert.run(alert.key);
+        if (alert.clearSnooze) statements.clearSnooze.run(sentAt, alert.taskKey);
+      });
+      commit();
+    },
+
     close: () => db.close(),
   };
 }
 
 module.exports = { openDatabase };
-
